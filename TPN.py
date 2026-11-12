@@ -1,9 +1,9 @@
 """
 TPN / PN 計算器 (Streamlit)
 複製自 TPN_20260828.xlsx 的計算邏輯:
-  - REE: Schofield-type 公式 (Sheet2)
-  - 熱量需求 = REE x 壓力參數 x 0.85
-  - PN 熱量 = Dex(g) x 3.4 + AA(g) x 4 + Fat(g) x 9
+  - 能量估算公式 (Sheet2): <3 歲為 DRI EER, 3 歲以上為 REE
+  - 熱量需求 = 估算值 x 壓力參數 x 0.85
+  - PN 熱量 = Dex(g) x 3.4 + AA(g) x 4 + SMOFlipid 20%(mL) x 2
   - SIR (mg/kg/min) = Dex(g) x 1000 / 1440 / BW
   - AA、Fat (g/kg/day)
 執行: streamlit run streamlit_app.py
@@ -19,7 +19,14 @@ import streamlit as st
 # ----------------------------------------------------------------------
 DEX_KCAL_PER_G = 3.4
 AA_KCAL_PER_G = 4.0
-FAT_KCAL_PER_G = 9.0
+# SMOFlipid 20%: 0.2 g/mL, 2 kcal/mL (含甘油、磷脂質; 即約 10 kcal/g)
+FAT_G_PER_ML = 0.2
+FAT_KCAL_PER_ML = 2.0
+
+# 警示門檻
+KCAL_OVER_LIMIT = 1.10   # PN 熱量超過目標 110% 提醒
+KCAL_UNDER_LIMIT = 0.90  # 低於目標 90% 提醒
+FLUID_OVER_LIMIT = 1.10  # 總液體量超過維持量 110% 提醒
 
 STRESS_OPTIONS = {
     "1.3 — 營養良好、臥床、輕~中度壓力": 1.3,
@@ -29,10 +36,10 @@ STRESS_OPTIONS = {
 
 
 def calc_ree(age_y: float, sex: str, bw: float) -> float:
-    """Sheet2 的 REE 公式 (年齡單位: 歲; 0.3 歲≈3 個月, 0.6 歲≈6 個月)。"""
-    if age_y <= 0.3:
+    """Sheet2 的公式 (年齡單位: 歲; 0.25 歲 = 3 個月, 0.5 歲 = 6 個月)。"""
+    if age_y <= 0.25:
         return 89 * bw + 75
-    if age_y <= 0.6:
+    if age_y <= 0.5:
         return 89 * bw - 44
     if age_y <= 1:
         return 89 * bw - 78
@@ -43,15 +50,29 @@ def calc_ree(age_y: float, sex: str, bw: float) -> float:
     return 17.5 * bw + 651 if sex == "M" else 12.2 * bw + 746
 
 
-def calc_pn(df: pd.DataFrame, fat_conc: float, fat_vol: float, bw: float) -> dict:
-    """df 欄位: Dex (%), AA (%), Volume (mL)。fat_conc 單位 g/mL (SMOF 20% = 0.2)。"""
+def energy_label(age_y: float) -> str:
+    """<3 歲公式為 DRI EER(已含生長/活動), 3 歲以上為 REE。"""
+    return "EER" if age_y < 3 else "REE"
+
+
+def maintenance_fluid(bw: float) -> float:
+    """Holliday-Segar 每日維持液體量 (mL/day)。"""
+    if bw <= 10:
+        return 100 * bw
+    if bw <= 20:
+        return 1000 + 50 * (bw - 10)
+    return 1500 + 20 * (bw - 20)
+
+
+def calc_pn(df: pd.DataFrame, fat_vol: float, bw: float) -> dict:
+    """df 欄位: Dex (%), AA (%), Volume (mL)。fat_vol 為 SMOFlipid 20% 的 mL/day。"""
     d = df.fillna(0)
     dex_g = (d["Dex (%)"] * d["Volume (mL)"] / 100).sum()
     aa_g = (d["AA (%)"] * d["Volume (mL)"] / 100).sum()
-    fat_g = fat_conc * fat_vol
+    fat_g = FAT_G_PER_ML * fat_vol
     kcal_dex = dex_g * DEX_KCAL_PER_G
     kcal_aa = aa_g * AA_KCAL_PER_G
-    kcal_fat = fat_g * FAT_KCAL_PER_G
+    kcal_fat = fat_vol * FAT_KCAL_PER_ML
     return {
         "dex_g": dex_g,
         "aa_g": aa_g,
@@ -87,7 +108,6 @@ def load_from_xlsx(file) -> dict | None:
             "sex": str(ws["B2"].value).strip().upper(),
             "bw": float(ws["B3"].value),
             "stress": float(ws["B4"].value),
-            "fat_conc": float(ws["B18"].value or 0),
             "fat_vol": float(ws["C18"].value or 0),
             "bags": pd.DataFrame(rows),
         }
@@ -143,12 +163,17 @@ cal_factor = st.sidebar.number_input("熱量係數 (REE x ?)", 0.5, 1.5, 0.85, 0
 
 # --- 目標熱量 ---
 ree = calc_ree(age, sex, bw)
+elabel = energy_label(age)
 target_kcal = ree * stress * cal_factor
+maint = maintenance_fluid(bw)
 
 c1, c2, c3 = st.columns(3)
-c1.metric("REE (kcal/d)", f"{ree:,.0f}")
-c2.metric(f"熱量需求 (REE × {stress} × {cal_factor})", f"{target_kcal:,.0f} kcal/d")
+c1.metric(f"{elabel} (kcal/d)", f"{ree:,.0f}")
+c2.metric(f"熱量需求 ({elabel} × {stress} × {cal_factor})", f"{target_kcal:,.0f} kcal/d")
 c3.metric("每公斤目標熱量", f"{target_kcal / bw:,.1f} kcal/kg/d")
+if elabel == "EER":
+    st.info("3 歲以下使用 DRI EER 公式,已包含生長與活動所需能量;"
+            "再乘壓力參數與熱量係數可能重複加成,請依單位慣例確認。")
 
 st.divider()
 
@@ -171,14 +196,13 @@ with left:
     )
 
 with right:
-    st.subheader("脂肪 Fat (SMOF)")
-    fat_conc = st.number_input("濃度 (g/mL,20% = 0.2)", 0.0, 1.0,
-                               float(default("fat_conc", 0.2)), 0.05)
+    st.subheader("脂肪 Fat (SMOFlipid 20%)")
+    st.caption("0.2 g/mL、2 kcal/mL(約 10 kcal/g)")
     fat_vol = st.number_input("容量 (mL/day)", 0.0, 2000.0,
                               float(default("fat_vol", 400.0)), 50.0)
 
 # --- 計算 ---
-r = calc_pn(bags, fat_conc, fat_vol, bw)
+r = calc_pn(bags, fat_vol, bw)
 
 st.divider()
 st.subheader("計算結果")
@@ -197,7 +221,7 @@ st.progress(min(pct / 100, 1.0), text=f"達成目標熱量 {pct:.0f}%  "
 # 明細
 detail = pd.DataFrame(
     {
-        "成分": ["Dextrose", "Amino acid", "Fat", "合計"],
+        "成分": ["Dextrose", "Amino acid", "Fat (SMOFlipid)", "合計"],
         "克數 (g/day)": [r["dex_g"], r["aa_g"], r["fat_g"], None],
         "熱量 (kcal/day)": [r["kcal_dex"], r["kcal_aa"], r["kcal_fat"], r["kcal"]],
         "熱量占比 (%)": [
@@ -214,8 +238,10 @@ st.dataframe(
     hide_index=True,
     use_container_width=True,
 )
+fluid_pct = r["volume"] / maint * 100 if maint else 0
 st.caption(f"總液體量 (PN + Fat):{r['volume']:,.0f} mL/day "
-           f"({r['volume'] / bw:,.0f} mL/kg/day)")
+           f"({r['volume'] / bw:,.0f} mL/kg/day);"
+           f"Holliday-Segar 維持量 {maint:,.0f} mL/day,占 {fluid_pct:.0f}%")
 
 # --- 目標對照與提示 ---
 st.subheader("目標範圍對照")
@@ -241,15 +267,25 @@ if r["aa_kg"] > max_aa:
     warns.append(f"AA {r['aa_kg']:.2f} g/kg/day 超過上限 {max_aa:g}")
 if r["fat_kg"] > max_fat:
     warns.append(f"Fat {r['fat_kg']:.2f} g/kg/day 超過上限 {max_fat:g}")
+if target_kcal > 0:
+    ratio = r["kcal"] / target_kcal
+    if ratio > KCAL_OVER_LIMIT:
+        warns.append(f"PN 熱量 {r['kcal']:,.0f} kcal 為目標的 {ratio * 100:.0f}%,超過目標 "
+                     f"{(KCAL_OVER_LIMIT - 1) * 100:.0f}% 以上")
+    elif ratio < KCAL_UNDER_LIMIT and r["kcal"] > 0:
+        warns.append(f"PN 熱量僅達目標的 {ratio * 100:.0f}%")
+if maint > 0 and r["volume"] > maint * FLUID_OVER_LIMIT:
+    warns.append(f"總液體量 {r['volume']:,.0f} mL 為維持量的 {fluid_pct:.0f}%,請留意液體過多")
 if warns:
-    st.warning("⚠️ " + ";".join(warns))
+    for w in warns:
+        st.warning("⚠️ " + w)
 else:
-    st.success("SIR / AA / Fat 皆在上限範圍內")
+    st.success("熱量、液體量與 SIR / AA / Fat 皆在建議範圍內")
 
 # --- 匯出 ---
 summary = pd.DataFrame(
     {
-        "項目": ["年齡(歲)", "性別", "體重(kg)", "壓力參數", "REE", "目標熱量(kcal/d)",
+        "項目": ["年齡(歲)", "性別", "體重(kg)", "壓力參數", elabel, "目標熱量(kcal/d)",
                  "PN熱量(kcal/d)", "SIR(mg/kg/min)", "AA(g/kg/day)", "Fat(g/kg/day)"],
         "數值": [age, sex, bw, stress, round(ree, 1), round(target_kcal, 1),
                  round(r["kcal"], 1), round(r["sir"], 2), round(r["aa_kg"], 2),
