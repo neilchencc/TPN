@@ -158,8 +158,18 @@ stress = STRESS_OPTIONS[stress_label]
 custom = st.sidebar.checkbox("自訂壓力參數")
 if custom:
     stress = st.sidebar.number_input("壓力參數", 1.0, 2.5, float(stress), 0.05)
-cal_factor = st.sidebar.number_input("熱量係數 (REE x ?)", 0.5, 1.5, 0.85, 0.05,
-                                     help="Excel 中固定為 0.85")
+cal_factor = st.sidebar.number_input(
+    "熱量係數 (REE x ?)", 0.5, 1.5, 0.85, 0.05,
+    help=(
+        "PN 熱量需求通常比腸道營養 (EN) 低約 10–15%:\n\n"
+        "- PN 直接進入血液,無消化吸收、無糞便流失\n"
+        "- 食物熱效應較低\n"
+        "- 可減少過度餵食造成的高血糖、肝功能異常\n\n"
+        "建議 0.85–0.9 (Excel 中固定為 0.85)。"
+        "若同時有部分腸道營養或單位慣例不打折,可改為 0.9–1.0。"
+    ),
+)
+st.sidebar.caption("熱量係數:PN 約為 EN 需求的 85–90%,預設 0.85")
 
 # --- 目標熱量 ---
 ree = calc_ree(age, sex, bw)
