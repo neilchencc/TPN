@@ -28,10 +28,11 @@ KCAL_OVER_LIMIT = 1.10   # PN 熱量超過目標 110% 提醒
 KCAL_UNDER_LIMIT = 0.90  # 低於目標 90% 提醒
 FLUID_OVER_LIMIT = 1.10  # 總液體量超過維持量 110% 提醒
 
+# 壓力參數: 選單只顯示數值,說明另外列在選單下方
 STRESS_OPTIONS = {
-    "1.3 — 營養良好、臥床、輕~中度壓力": 1.3,
-    "1.5 — 正常活動且輕~中度壓力 / 臥床但重度壓力 / 低活動且營養不良需追趕": 1.5,
-    "1.7 — 活動量大需追趕生長 / 活動量大且重度壓力": 1.7,
+    1.3: "營養良好、臥床、輕~中度壓力",
+    1.5: "正常活動且輕~中度壓力 / 臥床但重度壓力 / 低活動且營養不良需追趕",
+    1.7: "活動量大需追趕生長 / 活動量大且重度壓力",
 }
 
 
@@ -133,14 +134,16 @@ st.markdown(
 
 # --- 病人資料 ---
 st.sidebar.header("病人資料")
-age = st.sidebar.number_input("年齡 (歲)", 0.0, 18.0, 10.0, 0.1,
-                              help="嬰兒請用小數,例如 3 個月 = 0.25")
-sex = st.sidebar.radio("性別", ["M", "F"], index=0, horizontal=True)
+col_age, col_sex = st.sidebar.columns([3, 2])
+age = col_age.number_input("年齡 (歲)", 0.0, 18.0, 10.0, 0.1,
+                           help="嬰兒請用小數,例如 3 個月 = 0.25")
+sex = col_sex.radio("性別", ["M", "F"], index=0, horizontal=True)
 bw = st.sidebar.number_input("體重 (kg)", 1.0, 150.0, 34.5, 0.1)
 
 stress_keys = list(STRESS_OPTIONS)
-stress_label = st.sidebar.selectbox("壓力參數", stress_keys, index=2)
-stress = STRESS_OPTIONS[stress_label]
+stress = st.sidebar.selectbox("壓力參數", stress_keys, index=2,
+                              format_func=lambda v: f"{v:g}")
+st.sidebar.caption("\n\n".join(f"**{k:g}**:{v}" for k, v in STRESS_OPTIONS.items()))
 custom = st.sidebar.checkbox("自訂壓力參數")
 if custom:
     stress = st.sidebar.number_input("壓力參數", 1.0, 2.5, float(stress), 0.05)
@@ -163,15 +166,6 @@ elabel = energy_label(age)
 target_kcal = ree * stress * cal_factor
 maint = maintenance_fluid(bw)
 
-c1, c2 = st.columns(2)
-c1.metric(f"{elabel} (kcal/d)", f"{ree:,.0f}")
-c2.metric(f"熱量需求 ({elabel} × {stress} × {cal_factor})", f"{target_kcal:,.0f} kcal/d")
-if elabel == "EER":
-    st.info("3 歲以下使用 DRI EER 公式,已包含生長與活動所需能量;"
-            "再乘壓力參數與熱量係數可能重複加成,請依單位慣例確認。")
-
-st.divider()
-
 # --- PN 輸入 ---
 left, right = st.columns([3, 2])
 with left:
@@ -192,7 +186,7 @@ with left:
 with right:
     st.subheader("脂肪 Fat (SMOFlipid 20%)")
     st.caption("0.2 g/mL、2 kcal/mL(約 10 kcal/g)")
-    fat_vol = st.number_input("容量 (mL/day)", 0.0, 2000.0, 400.0, 50.0)
+    fat_vol = st.number_input("容量 (mL/day)", 0, 2000, 400, 50, format="%d")
 
 # --- 計算 ---
 r = calc_pn(bags, fat_vol, bw)
@@ -200,12 +194,19 @@ r = calc_pn(bags, fat_vol, bw)
 st.divider()
 st.subheader("計算結果")
 
-m1, m2, m3, m4 = st.columns(4)
+m0a, m0b, m1, m2, m3, m4 = st.columns(6)
+m0a.metric(f"{elabel} (kcal/d)", f"{ree:,.0f}")
+m0b.metric("熱量需求 (kcal/d)", f"{target_kcal:,.0f}",
+           help=f"{elabel} × {stress:g} × {cal_factor:g}")
 m1.metric("PN 熱量 (Kcal/day)", f"{r['kcal']:,.0f}",
           f"{r['kcal'] - target_kcal:+,.0f} vs 目標")
 m2.metric("SIR (mg/kg/min)", f"{r['sir']:.2f}")
 m3.metric("AA (g/kg/day)", f"{r['aa_kg']:.2f}")
 m4.metric("Fat (g/kg/day)", f"{r['fat_kg']:.2f}")
+st.caption(f"熱量需求 = {elabel} {ree:,.0f} × 壓力參數 {stress:g} × 熱量係數 {cal_factor:g}")
+if elabel == "EER":
+    st.info("3 歲以下使用 DRI EER 公式,已包含生長與活動所需能量;"
+            "再乘壓力參數與熱量係數可能重複加成,請依單位慣例確認。")
 
 pct = r["kcal"] / target_kcal * 100 if target_kcal else 0
 st.progress(min(pct / 100, 1.0), text=f"達成目標熱量 {pct:.0f}%  "
