@@ -258,9 +258,9 @@ summary = pd.DataFrame(
 )
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-    summary.to_excel(xw, "Summary", index=False)
-    bags.to_excel(xw, "PN", index=False)
-    detail.to_excel(xw, "Detail", index=False)
+    summary.to_excel(xw, sheet_name="Summary", index=False)
+    bags.to_excel(xw, sheet_name="PN", index=False)
+    detail.to_excel(xw, sheet_name="Detail", index=False)
 st.download_button("⬇️ 下載計算結果 (xlsx)", buf.getvalue(),
                    file_name="PN_result.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
