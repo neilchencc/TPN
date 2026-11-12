@@ -114,8 +114,12 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.title("💉 PN (全靜脈營養) 計算器")
-st.caption("依 TPN_20260828.xlsx 的公式計算熱量、SIR、AA 與 Fat。 ｜ Neil JJC HMMCH 製作")
+st.markdown(
+    "<h1 style='margin-bottom:0'>💉 PN (全靜脈營養) 計算器 "
+    "<span style='font-size:0.9rem; font-weight:400; color:gray;'>"
+    "Neil JJC HMMCH 製作</span></h1>",
+    unsafe_allow_html=True,
+)
 
 # --- 病人資料 ---
 st.sidebar.header("病人資料")
