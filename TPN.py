@@ -8,9 +8,6 @@ TPN / PN 計算器 (Streamlit)
   - AA、Fat (g/kg/day)
 執行: streamlit run streamlit_app.py
 """
-import io
-
-import openpyxl
 import pandas as pd
 import streamlit as st
 
@@ -88,34 +85,6 @@ def calc_pn(df: pd.DataFrame, fat_vol: float, bw: float) -> dict:
     }
 
 
-# ----------------------------------------------------------------------
-# 讀取 xlsx 預設值 (版面同 TPN_20260828.xlsx 的 Sheet1)
-# ----------------------------------------------------------------------
-def load_from_xlsx(file) -> dict | None:
-    try:
-        ws = openpyxl.load_workbook(file, data_only=True)["Sheet1"]
-        rows = []
-        for r in range(11, 17):
-            rows.append(
-                {
-                    "Dex (%)": float(ws.cell(r, 1).value or 0),
-                    "AA (%)": float(ws.cell(r, 2).value or 0),
-                    "Volume (mL)": float(ws.cell(r, 3).value or 0),
-                }
-            )
-        return {
-            "age": float(ws["B1"].value),
-            "sex": str(ws["B2"].value).strip().upper(),
-            "bw": float(ws["B3"].value),
-            "stress": float(ws["B4"].value),
-            "fat_vol": float(ws["C18"].value or 0),
-            "bags": pd.DataFrame(rows),
-        }
-    except Exception as e:  # noqa: BLE001
-        st.sidebar.error(f"無法讀取 xlsx:{e}")
-        return None
-
-
 DEFAULT_BAGS = pd.DataFrame(
     {
         "Dex (%)": [5, 7.5, 10, 12.5, 15, 20],
@@ -131,29 +100,15 @@ st.set_page_config(page_title="PN 計算器", page_icon="💉", layout="wide")
 st.title("💉 PN (全靜脈營養) 計算器")
 st.caption("依 TPN_20260828.xlsx 的公式計算熱量、SIR、AA 與 Fat。")
 
-# 上傳 xlsx 以預填
-up = st.sidebar.file_uploader("上傳 TPN xlsx 預填資料 (選填)", type=["xlsx"])
-loaded = load_from_xlsx(up) if up else None
-if loaded:
-    st.sidebar.success("已由 xlsx 載入預設值")
-
-
-def default(key, fallback):
-    return loaded[key] if loaded else fallback
-
-
 # --- 病人資料 ---
 st.sidebar.header("病人資料")
-age = st.sidebar.number_input("年齡 (歲)", 0.0, 18.0, float(default("age", 10.0)), 0.1,
+age = st.sidebar.number_input("年齡 (歲)", 0.0, 18.0, 10.0, 0.1,
                               help="嬰兒請用小數,例如 3 個月 = 0.25")
-sex = st.sidebar.radio("性別", ["M", "F"], index=0 if default("sex", "M") == "M" else 1,
-                       horizontal=True)
-bw = st.sidebar.number_input("體重 (kg)", 1.0, 150.0, float(default("bw", 34.5)), 0.1)
+sex = st.sidebar.radio("性別", ["M", "F"], index=0, horizontal=True)
+bw = st.sidebar.number_input("體重 (kg)", 1.0, 150.0, 34.5, 0.1)
 
-stress_default = default("stress", 1.7)
 stress_keys = list(STRESS_OPTIONS)
-idx = min(range(3), key=lambda i: abs(list(STRESS_OPTIONS.values())[i] - stress_default))
-stress_label = st.sidebar.selectbox("壓力參數", stress_keys, index=idx)
+stress_label = st.sidebar.selectbox("壓力參數", stress_keys, index=2)
 stress = STRESS_OPTIONS[stress_label]
 custom = st.sidebar.checkbox("自訂壓力參數")
 if custom:
@@ -192,9 +147,8 @@ left, right = st.columns([3, 2])
 with left:
     st.subheader("PN 配方")
     st.caption("輸入各濃度組合的每日容量 (mL),未使用請填 0。可新增 / 修改濃度。")
-    bags_init = loaded["bags"] if loaded else DEFAULT_BAGS
     bags = st.data_editor(
-        bags_init,
+        DEFAULT_BAGS,
         num_rows="dynamic",
         use_container_width=True,
         column_config={
@@ -208,8 +162,7 @@ with left:
 with right:
     st.subheader("脂肪 Fat (SMOFlipid 20%)")
     st.caption("0.2 g/mL、2 kcal/mL(約 10 kcal/g)")
-    fat_vol = st.number_input("容量 (mL/day)", 0.0, 2000.0,
-                              float(default("fat_vol", 400.0)), 50.0)
+    fat_vol = st.number_input("容量 (mL/day)", 0.0, 2000.0, 400.0, 50.0)
 
 # --- 計算 ---
 r = calc_pn(bags, fat_vol, bw)
@@ -291,24 +244,5 @@ if warns:
         st.warning("⚠️ " + w)
 else:
     st.success("熱量、液體量與 SIR / AA / Fat 皆在建議範圍內")
-
-# --- 匯出 ---
-summary = pd.DataFrame(
-    {
-        "項目": ["年齡(歲)", "性別", "體重(kg)", "壓力參數", elabel, "目標熱量(kcal/d)",
-                 "PN熱量(kcal/d)", "SIR(mg/kg/min)", "AA(g/kg/day)", "Fat(g/kg/day)"],
-        "數值": [age, sex, bw, stress, round(ree, 1), round(target_kcal, 1),
-                 round(r["kcal"], 1), round(r["sir"], 2), round(r["aa_kg"], 2),
-                 round(r["fat_kg"], 2)],
-    }
-)
-buf = io.BytesIO()
-with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-    summary.to_excel(xw, sheet_name="Summary", index=False)
-    bags.to_excel(xw, sheet_name="PN", index=False)
-    detail.to_excel(xw, sheet_name="Detail", index=False)
-st.download_button("⬇️ 下載計算結果 (xlsx)", buf.getvalue(),
-                   file_name="PN_result.xlsx",
-                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 st.caption("※ 本工具僅供輔助計算,實際處方請由臨床醫師/營養師確認。")
