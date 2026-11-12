@@ -128,8 +128,7 @@ if LOGO_PATH.exists():
 st.markdown(
     f"<h1 style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>"
     f"{logo_html}靜脈營養計算器&nbsp;"
-    "<span style='font-size:0.9rem; font-weight:400; color:gray;'>"
-    #"Neil JJC HMMCH 製作</span></h1>",
+    "<span style='font-size:0.9rem; font-weight:400; color:gray;'>,
     unsafe_allow_html=True,
 )
 
