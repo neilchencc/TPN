@@ -127,8 +127,7 @@ if LOGO_PATH.exists():
                  "style='height:64px; vertical-align:middle; margin-right:12px;'>")
 st.markdown(
     f"<h1 style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>"
-    f"{logo_html}靜脈營養計算器&nbsp;"
-    "<span style='font-size:0.9rem; font-weight:400; color:gray;'>,
+    f"{logo_html}靜脈營養計算器</h1>",
     unsafe_allow_html=True,
 )
 
