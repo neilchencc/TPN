@@ -115,7 +115,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.markdown(
-    "<h1 style='margin-bottom:0'>💉 PN (全靜脈營養) 計算器 "
+    "<h1 style='margin-bottom:0'>靜脈營養計算器 "
     "<span style='font-size:0.9rem; font-weight:400; color:gray;'>"
     "Neil JJC HMMCH 製作</span></h1>",
     unsafe_allow_html=True,
