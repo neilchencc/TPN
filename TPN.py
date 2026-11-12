@@ -8,6 +8,9 @@ TPN / PN 計算器 (Streamlit)
   - AA、Fat (g/kg/day)
 執行: streamlit run streamlit_app.py
 """
+import base64
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
 
@@ -96,7 +99,9 @@ DEFAULT_BAGS = pd.DataFrame(
 # ----------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------
-st.set_page_config(page_title="PN 計算器", page_icon="💉", layout="wide",
+_logo = Path(__file__).parent / "logo.png"
+st.set_page_config(page_title="靜脈營養計算器",
+                   page_icon=str(_logo) if _logo.exists() else "💉", layout="wide",
                    initial_sidebar_state="expanded")
 # 隱藏側邊欄的收合按鈕 («),讓病人資料欄固定顯示
 st.markdown(
@@ -114,8 +119,15 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+LOGO_PATH = Path(__file__).parent / "logo.png"
+logo_html = ""
+if LOGO_PATH.exists():
+    logo_b64 = base64.b64encode(LOGO_PATH.read_bytes()).decode()
+    logo_html = (f"<img src='data:image/png;base64,{logo_b64}' "
+                 "style='height:64px; vertical-align:middle; margin-right:12px;'>")
 st.markdown(
-    "<h1 style='margin-bottom:0'>靜脈營養計算器 "
+    f"<h1 style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>"
+    f"{logo_html}靜脈營養計算器&nbsp;"
     "<span style='font-size:0.9rem; font-weight:400; color:gray;'>"
     "Neil JJC HMMCH 製作</span></h1>",
     unsafe_allow_html=True,
