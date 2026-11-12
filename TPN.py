@@ -104,6 +104,12 @@ st.markdown(
     <style>
     [data-testid="stSidebarCollapseButton"],
     [data-testid="stSidebarHeader"] button { display: none !important; }
+    /* 縮小上方空白 */
+    [data-testid="stSidebarHeader"] { display: none !important; }
+    [data-testid="stSidebarUserContent"] { padding-top: 1rem !important; }
+    .block-container,
+    [data-testid="stMainBlockContainer"] { padding-top: 1.5rem !important; }
+    header[data-testid="stHeader"] { background: transparent; }
     </style>
     """,
     unsafe_allow_html=True,
