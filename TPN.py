@@ -126,9 +126,27 @@ if LOGO_PATH.exists():
     logo_b64 = base64.b64encode(LOGO_PATH.read_bytes()).decode()
     logo_html = (f"<img src='data:image/png;base64,{logo_b64}' "
                  "style='height:64px; vertical-align:middle; margin-right:12px;'>")
+# 標題列固定在畫面上方: 主畫面往下捲動時 logo 與標題不動
+try:
+    _dark = st.context.theme.type == "dark"  # Streamlit >= 1.46
+except Exception:
+    _dark = False
+_header_bg = "#0e1117" if _dark else "#ffffff"
 st.markdown(
-    f"<h1 style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>"
-    f"{logo_html}靜脈營養計算器</h1>",
+    f"""
+    <style>
+    [data-testid="stElementContainer"]:has(.app-title),
+    .element-container:has(.app-title) {{
+        position: sticky;
+        top: 0;
+        z-index: 999;
+        background-color: {_header_bg};
+        padding-bottom: 0.25rem;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+    }}
+    </style>
+    <h1 class='app-title' style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>{logo_html}靜脈營養計算器</h1>
+    """,
     unsafe_allow_html=True,
 )
 
