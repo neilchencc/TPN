@@ -96,7 +96,18 @@ DEFAULT_BAGS = pd.DataFrame(
 # ----------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------
-st.set_page_config(page_title="PN 計算器", page_icon="💉", layout="wide")
+st.set_page_config(page_title="PN 計算器", page_icon="💉", layout="wide",
+                   initial_sidebar_state="expanded")
+# 隱藏側邊欄的收合按鈕 («),讓病人資料欄固定顯示
+st.markdown(
+    """
+    <style>
+    [data-testid="stSidebarCollapseButton"],
+    [data-testid="stSidebarHeader"] button { display: none !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.title("💉 PN (全靜脈營養) 計算器")
 st.caption("依 TPN_20260828.xlsx 的公式計算熱量、SIR、AA 與 Fat。")
 
@@ -132,10 +143,9 @@ elabel = energy_label(age)
 target_kcal = ree * stress * cal_factor
 maint = maintenance_fluid(bw)
 
-c1, c2, c3 = st.columns(3)
+c1, c2 = st.columns(2)
 c1.metric(f"{elabel} (kcal/d)", f"{ree:,.0f}")
 c2.metric(f"熱量需求 ({elabel} × {stress} × {cal_factor})", f"{target_kcal:,.0f} kcal/d")
-c3.metric("每公斤目標熱量", f"{target_kcal / bw:,.1f} kcal/kg/d")
 if elabel == "EER":
     st.info("3 歲以下使用 DRI EER 公式,已包含生長與活動所需能量;"
             "再乘壓力參數與熱量係數可能重複加成,請依單位慣例確認。")
