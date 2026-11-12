@@ -166,76 +166,78 @@ elabel = energy_label(age)
 target_kcal = ree * stress * cal_factor
 maint = maintenance_fluid(bw)
 
-# --- PN 輸入 ---
-left, right = st.columns([3, 2])
+# --- 版面: 左側 PN 配方輸入、右側計算結果,同一畫面顯示 ---
+left, right = st.columns([2, 3], gap="large")
 with left:
     st.subheader("PN 配方")
-    st.caption("輸入各濃度組合的每日容量 (mL),未使用請填 0。可新增 / 修改濃度。")
+    st.caption("輸入各濃度組合的每日容量 (mL),未使用請填 0。濃度可直接修改。")
     bags = st.data_editor(
         DEFAULT_BAGS,
-        num_rows="dynamic",
+        num_rows="fixed",
+        hide_index=True,
         use_container_width=True,
         column_config={
             "Dex (%)": st.column_config.NumberColumn(min_value=0.0, max_value=50.0, step=0.5),
             "AA (%)": st.column_config.NumberColumn(min_value=0.0, max_value=15.0, step=0.5),
-            "Volume (mL)": st.column_config.NumberColumn(min_value=0.0, step=50.0),
+            "Volume (mL)": st.column_config.NumberColumn(min_value=0, step=50, format="%d"),
         },
         key="bags",
     )
 
-with right:
-    st.subheader("脂肪 Fat (SMOFlipid 20%)")
-    st.caption("0.2 g/mL、2 kcal/mL(約 10 kcal/g)")
-    fat_vol = st.number_input("容量 (mL/day)", 0, 2000, 400, 50, format="%d")
+    st.markdown("**脂肪 Fat (SMOFlipid 20%)**")
+    fat_vol = st.number_input("容量 (mL/day)", 0, 2000, 400, 50, format="%d",
+                              help="0.2 g/mL、2 kcal/mL(約 10 kcal/g)")
 
 # --- 計算 ---
 r = calc_pn(bags, fat_vol, bw)
+pct = r["kcal"] / target_kcal * 100 if target_kcal else 0
+fluid_pct = r["volume"] / maint * 100 if maint else 0
+
+with right:
+    st.subheader("計算結果")
+    m0a, m0b, m1 = st.columns(3)
+    m0a.metric(f"{elabel} (kcal/d)", f"{ree:,.0f}")
+    m0b.metric("熱量需求 (kcal/d)", f"{target_kcal:,.0f}",
+               help=f"{elabel} × {stress:g} × {cal_factor:g}")
+    m1.metric("PN 熱量 (kcal/d)", f"{r['kcal']:,.0f}",
+              f"{r['kcal'] - target_kcal:+,.0f} vs 目標")
+    m2, m3, m4 = st.columns(3)
+    m2.metric("SIR (mg/kg/min)", f"{r['sir']:.2f}")
+    m3.metric("AA (g/kg/day)", f"{r['aa_kg']:.2f}")
+    m4.metric("Fat (g/kg/day)", f"{r['fat_kg']:.2f}")
+
+    st.progress(min(pct / 100, 1.0), text=f"達成目標熱量 {pct:.0f}%  "
+                                          f"({r['kcal']:,.0f} / {target_kcal:,.0f} kcal)")
+
+    # 明細
+    detail = pd.DataFrame(
+        {
+            "成分": ["Dextrose", "Amino acid", "Fat (SMOFlipid)", "合計"],
+            "克數 (g/day)": [r["dex_g"], r["aa_g"], r["fat_g"], None],
+            "熱量 (kcal/day)": [r["kcal_dex"], r["kcal_aa"], r["kcal_fat"], r["kcal"]],
+            "熱量占比 (%)": [
+                100 * r["kcal_dex"] / r["kcal"] if r["kcal"] else 0,
+                100 * r["kcal_aa"] / r["kcal"] if r["kcal"] else 0,
+                100 * r["kcal_fat"] / r["kcal"] if r["kcal"] else 0,
+                100 if r["kcal"] else 0,
+            ],
+        }
+    )
+    st.dataframe(
+        detail.style.format({"克數 (g/day)": "{:.1f}", "熱量 (kcal/day)": "{:,.0f}",
+                             "熱量占比 (%)": "{:.0f}"}, na_rep="—"),
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption(f"熱量需求 = {elabel} {ree:,.0f} × 壓力參數 {stress:g} × 熱量係數 {cal_factor:g}")
+    st.caption(f"總液體量 (PN + Fat):{r['volume']:,.0f} mL/day "
+               f"({r['volume'] / bw:,.0f} mL/kg/day);"
+               f"Holliday-Segar 維持量 {maint:,.0f} mL/day,占 {fluid_pct:.0f}%")
+    if elabel == "EER":
+        st.info("3 歲以下使用 DRI EER 公式,已包含生長與活動所需能量;"
+                "再乘壓力參數與熱量係數可能重複加成,請依單位慣例確認。")
 
 st.divider()
-st.subheader("計算結果")
-
-m0a, m0b, m1, m2, m3, m4 = st.columns(6)
-m0a.metric(f"{elabel} (kcal/d)", f"{ree:,.0f}")
-m0b.metric("熱量需求 (kcal/d)", f"{target_kcal:,.0f}",
-           help=f"{elabel} × {stress:g} × {cal_factor:g}")
-m1.metric("PN 熱量 (Kcal/day)", f"{r['kcal']:,.0f}",
-          f"{r['kcal'] - target_kcal:+,.0f} vs 目標")
-m2.metric("SIR (mg/kg/min)", f"{r['sir']:.2f}")
-m3.metric("AA (g/kg/day)", f"{r['aa_kg']:.2f}")
-m4.metric("Fat (g/kg/day)", f"{r['fat_kg']:.2f}")
-st.caption(f"熱量需求 = {elabel} {ree:,.0f} × 壓力參數 {stress:g} × 熱量係數 {cal_factor:g}")
-if elabel == "EER":
-    st.info("3 歲以下使用 DRI EER 公式,已包含生長與活動所需能量;"
-            "再乘壓力參數與熱量係數可能重複加成,請依單位慣例確認。")
-
-pct = r["kcal"] / target_kcal * 100 if target_kcal else 0
-st.progress(min(pct / 100, 1.0), text=f"達成目標熱量 {pct:.0f}%  "
-                                      f"({r['kcal']:,.0f} / {target_kcal:,.0f} kcal)")
-
-# 明細
-detail = pd.DataFrame(
-    {
-        "成分": ["Dextrose", "Amino acid", "Fat (SMOFlipid)", "合計"],
-        "克數 (g/day)": [r["dex_g"], r["aa_g"], r["fat_g"], None],
-        "熱量 (kcal/day)": [r["kcal_dex"], r["kcal_aa"], r["kcal_fat"], r["kcal"]],
-        "熱量占比 (%)": [
-            100 * r["kcal_dex"] / r["kcal"] if r["kcal"] else 0,
-            100 * r["kcal_aa"] / r["kcal"] if r["kcal"] else 0,
-            100 * r["kcal_fat"] / r["kcal"] if r["kcal"] else 0,
-            100 if r["kcal"] else 0,
-        ],
-    }
-)
-st.dataframe(
-    detail.style.format({"克數 (g/day)": "{:.1f}", "熱量 (kcal/day)": "{:,.0f}",
-                         "熱量占比 (%)": "{:.0f}"}, na_rep="—"),
-    hide_index=True,
-    use_container_width=True,
-)
-fluid_pct = r["volume"] / maint * 100 if maint else 0
-st.caption(f"總液體量 (PN + Fat):{r['volume']:,.0f} mL/day "
-           f"({r['volume'] / bw:,.0f} mL/kg/day);"
-           f"Holliday-Segar 維持量 {maint:,.0f} mL/day,占 {fluid_pct:.0f}%")
 
 # --- 目標對照與提示 ---
 st.subheader("目標範圍對照")
