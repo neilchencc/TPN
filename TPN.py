@@ -216,50 +216,59 @@ r = calc_pn(bags, fat_vol, bw)
 pct = r["kcal"] / target_kcal * 100 if target_kcal else 0
 fluid_pct = r["volume"] / maint * 100 if maint else 0
 
-# --- 提示 (顯示於計算結果內) ---
+# --- 超標判斷: 直接顯示在各指標下方 (紅字) ---
 infant = age < 1
+max_sir = 14.0
 max_aa = 4.0 if infant else 2.0
 max_fat = 3.0 if infant else 2.0
-warns = []
-if r["sir"] > 14:
-    warns.append(f"SIR {r['sir']:.1f} mg/kg/min 超過上限 12–14")
-if r["aa_kg"] > max_aa:
-    warns.append(f"AA {r['aa_kg']:.2f} g/kg/day 超過上限 {max_aa:g}")
-if r["fat_kg"] > max_fat:
-    warns.append(f"Fat {r['fat_kg']:.2f} g/kg/day 超過上限 {max_fat:g}")
-if target_kcal > 0:
-    ratio = r["kcal"] / target_kcal
-    if ratio > KCAL_OVER_LIMIT:
-        warns.append(f"PN 熱量 {r['kcal']:,.0f} kcal 為目標的 {ratio * 100:.0f}%,超過目標 "
-                     f"{(KCAL_OVER_LIMIT - 1) * 100:.0f}% 以上")
-    elif ratio < KCAL_UNDER_LIMIT and r["kcal"] > 0:
-        warns.append(f"PN 熱量僅達目標的 {ratio * 100:.0f}%")
+
+
+def over(value: float, limit: float, unit: str = "") -> dict:
+    """超過上限時回傳 metric 的 delta 設定 (紅色向上箭頭),否則不顯示。"""
+    if value > limit:
+        return {"delta": f"超過 {value - limit:.2f}{unit}", "delta_color": "inverse"}
+    return {}
+
+
+kcal_ratio = r["kcal"] / target_kcal if target_kcal else 0
+if kcal_ratio > KCAL_OVER_LIMIT:
+    kcal_delta = {"delta": f"超過目標 {r['kcal'] - target_kcal:,.0f}", "delta_color": "inverse"}
+elif 0 < kcal_ratio < KCAL_UNDER_LIMIT:
+    kcal_delta = {"delta": f"-{target_kcal - r['kcal']:,.0f} 不足", "delta_color": "normal"}
+else:
+    kcal_delta = {"delta": f"{r['kcal'] - target_kcal:+,.0f} vs 目標", "delta_color": "off"}
+
 if maint > 0 and r["volume"] > maint * FLUID_OVER_LIMIT:
-    warns.append(f"總液體量 {r['volume']:,.0f} mL 為維持量的 {fluid_pct:.0f}%,請留意液體過多")
+    fluid_delta = {"delta": f"超過維持量 {r['volume'] - maint:,.0f} mL", "delta_color": "inverse"}
+else:
+    fluid_delta = {"delta": f"維持量 {fluid_pct:.0f}%", "delta_color": "off"}
+
+sir_delta = over(r["sir"], max_sir)
+aa_delta = over(r["aa_kg"], max_aa)
+fat_delta = over(r["fat_kg"], max_fat)
+all_ok = not (sir_delta or aa_delta or fat_delta
+              or kcal_delta["delta_color"] != "off" or fluid_delta["delta_color"] != "off")
 
 with right:
     st.subheader("計算結果")
     m0a, m0b, m1 = st.columns(3)
-    m0a.metric("水分量 (mL/d)", f"{r['volume']:,.0f}",
-               f"維持量 {fluid_pct:.0f}%", delta_color="off",
+    m0a.metric("水分量 (mL/d)", f"{r['volume']:,.0f}", **fluid_delta,
                help=f"PN + Fat;{r['volume'] / bw:,.0f} mL/kg/day,"
                     f"Holliday-Segar 維持量 {maint:,.0f} mL/day")
     m0b.metric("熱量需求 (kcal/d)", f"{target_kcal:,.0f}",
                help=f"{elabel} × {stress:g} × {cal_factor:g}")
-    m1.metric("PN 熱量 (kcal/d)", f"{r['kcal']:,.0f}",
-              f"{r['kcal'] - target_kcal:+,.0f} vs 目標")
+    m1.metric("PN 熱量 (kcal/d)", f"{r['kcal']:,.0f}", **kcal_delta)
     m2, m3, m4 = st.columns(3)
-    m2.metric("SIR (mg/kg/min)", f"{r['sir']:.2f}")
-    m3.metric("AA (g/kg/day)", f"{r['aa_kg']:.2f}")
-    m4.metric("Fat (g/kg/day)", f"{r['fat_kg']:.2f}")
+    m2.metric("SIR (mg/kg/min)", f"{r['sir']:.2f}", **sir_delta,
+              help=f"上限 {max_sir:g}")
+    m3.metric("AA (g/kg/day)", f"{r['aa_kg']:.2f}", **aa_delta,
+              help=f"上限 {max_aa:g}")
+    m4.metric("Fat (g/kg/day)", f"{r['fat_kg']:.2f}", **fat_delta,
+              help=f"上限 {max_fat:g}")
 
     st.progress(min(pct / 100, 1.0), text=f"達成目標熱量 {pct:.0f}%  "
                                           f"({r['kcal']:,.0f} / {target_kcal:,.0f} kcal)")
-
-    if warns:
-        for w in warns:
-            st.warning("⚠️ " + w)
-    else:
+    if all_ok:
         st.success("熱量、液體量與 SIR / AA / Fat 皆在建議範圍內")
 
     # 目標範圍對照
