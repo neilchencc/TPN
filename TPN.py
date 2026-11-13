@@ -26,7 +26,8 @@ FAT_KCAL_PER_ML = 2.0
 # 警示門檻
 KCAL_OVER_LIMIT = 1.10   # PN 熱量超過目標 110% 提醒
 KCAL_UNDER_LIMIT = 0.90  # 低於目標 90% 提醒
-FLUID_OVER_LIMIT = 1.10  # 總液體量超過維持量 110% 提醒
+FLUID_OVER_LIMIT = 1.10   # 總液體量超過維持量 110% 提醒 (紅底)
+FLUID_UNDER_LIMIT = 0.90  # 低於維持量 90% 提醒 (紅底);介於兩者之間為綠底
 
 # 壓力參數: 選單只顯示數值,說明另外列在選單下方
 STRESS_OPTIONS = {
@@ -216,17 +217,23 @@ r = calc_pn(bags, fat_vol, bw)
 pct = r["kcal"] / target_kcal * 100 if target_kcal else 0
 fluid_pct = r["volume"] / maint * 100 if maint else 0
 
-# --- 超標判斷: 直接顯示在各指標下方 (紅字) ---
+# --- 超標 / 不足判斷: 直接顯示在各指標下方 (紅字) ---
 infant = age < 1
 max_sir = 14.0
+# 建議下限 = Initial 起始量的下緣
+min_sir, min_aa, min_fat = 3.0, 1.0, 0.5
 max_aa = 4.0 if infant else 2.0
 max_fat = 3.0 if infant else 2.0
 
 
-def over(value: float, limit: float, unit: str = "") -> dict:
-    """超過上限時回傳 metric 的 delta 設定 (紅色向上箭頭),否則不顯示。"""
-    if value > limit:
-        return {"delta": f"超過 {value - limit:.2f}{unit}", "delta_color": "inverse"}
+def check(value: float, low: float, high: float) -> dict:
+    """低於建議起始量或超過上限時,回傳 metric 的紅字 delta;範圍內則不顯示。"""
+    if value > high:
+        return {"delta": f"超過 {value - high:.2f}", "delta_color": "inverse"}
+    if value <= 0:
+        return {"delta": "-未給予", "delta_color": "normal"}
+    if value < low:
+        return {"delta": f"-{low - value:.2f} 低於建議 {low:g}", "delta_color": "normal"}
     return {}
 
 
@@ -238,33 +245,42 @@ elif 0 < kcal_ratio < KCAL_UNDER_LIMIT:
 else:
     kcal_delta = {"delta": f"{r['kcal'] - target_kcal:+,.0f} vs 目標", "delta_color": "off"}
 
-if maint > 0 and r["volume"] > maint * FLUID_OVER_LIMIT:
-    fluid_delta = {"delta": f"超過維持量 {r['volume'] - maint:,.0f} mL", "delta_color": "inverse"}
-else:
-    fluid_delta = {"delta": f"維持量 {fluid_pct:.0f}%", "delta_color": "off"}
+fluid_ok = maint > 0 and FLUID_UNDER_LIMIT <= r["volume"] / maint <= FLUID_OVER_LIMIT
 
-sir_delta = over(r["sir"], max_sir)
-aa_delta = over(r["aa_kg"], max_aa)
-fat_delta = over(r["fat_kg"], max_fat)
+sir_delta = check(r["sir"], min_sir, max_sir)
+aa_delta = check(r["aa_kg"], min_aa, max_aa)
+fat_delta = check(r["fat_kg"], min_fat, max_fat)
 all_ok = not (sir_delta or aa_delta or fat_delta
-              or kcal_delta["delta_color"] != "off" or fluid_delta["delta_color"] != "off")
+              or kcal_delta["delta_color"] != "off" or not fluid_ok)
 
 with right:
     st.subheader("計算結果")
     m0a, m0b, m1 = st.columns(3)
-    m0a.metric("水分量 (mL/d)", f"{r['volume']:,.0f}", **fluid_delta,
-               help=f"PN + Fat;{r['volume'] / bw:,.0f} mL/kg/day,"
-                    f"Holliday-Segar 維持量 {maint:,.0f} mL/day")
+    # 水分量: 自訂卡片,介於建議量 90–110% 為綠底,超出或不足為紅底
+    _fg, _bg = ("#177233", "#dff3e4") if fluid_ok else ("#b42318", "#fde4e1")
+    m0a.markdown(
+        f"""
+        <div title="PN + Fat;{r['volume'] / bw:,.0f} mL/kg/day">
+          <div style="font-size:0.875rem; opacity:0.8;">水分量 (mL/d)</div>
+          <div style="font-size:2.25rem; line-height:1.3;">{r['volume']:,.0f}</div>
+          <span style="display:inline-block; padding:2px 10px; border-radius:999px;
+                font-size:0.875rem; color:{_fg}; background:{_bg};">
+            建議量的 {fluid_pct:.0f}%(建議 {maint:,.0f} mL)
+          </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     m0b.metric("熱量需求 (kcal/d)", f"{target_kcal:,.0f}",
                help=f"{elabel} × {stress:g} × {cal_factor:g}")
     m1.metric("PN 熱量 (kcal/d)", f"{r['kcal']:,.0f}", **kcal_delta)
     m2, m3, m4 = st.columns(3)
     m2.metric("SIR (mg/kg/min)", f"{r['sir']:.2f}", **sir_delta,
-              help=f"上限 {max_sir:g}")
+              help=f"建議 {min_sir:g} – {max_sir:g}")
     m3.metric("AA (g/kg/day)", f"{r['aa_kg']:.2f}", **aa_delta,
-              help=f"上限 {max_aa:g}")
+              help=f"建議 {min_aa:g} – {max_aa:g}")
     m4.metric("Fat (g/kg/day)", f"{r['fat_kg']:.2f}", **fat_delta,
-              help=f"上限 {max_fat:g}")
+              help=f"建議 {min_fat:g} – {max_fat:g}")
 
     st.progress(min(pct / 100, 1.0), text=f"達成目標熱量 {pct:.0f}%  "
                                           f"({r['kcal']:,.0f} / {target_kcal:,.0f} kcal)")
