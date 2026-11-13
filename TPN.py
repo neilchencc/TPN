@@ -216,10 +216,34 @@ r = calc_pn(bags, fat_vol, bw)
 pct = r["kcal"] / target_kcal * 100 if target_kcal else 0
 fluid_pct = r["volume"] / maint * 100 if maint else 0
 
+# --- 提示 (顯示於計算結果內) ---
+infant = age < 1
+max_aa = 4.0 if infant else 2.0
+max_fat = 3.0 if infant else 2.0
+warns = []
+if r["sir"] > 14:
+    warns.append(f"SIR {r['sir']:.1f} mg/kg/min 超過上限 12–14")
+if r["aa_kg"] > max_aa:
+    warns.append(f"AA {r['aa_kg']:.2f} g/kg/day 超過上限 {max_aa:g}")
+if r["fat_kg"] > max_fat:
+    warns.append(f"Fat {r['fat_kg']:.2f} g/kg/day 超過上限 {max_fat:g}")
+if target_kcal > 0:
+    ratio = r["kcal"] / target_kcal
+    if ratio > KCAL_OVER_LIMIT:
+        warns.append(f"PN 熱量 {r['kcal']:,.0f} kcal 為目標的 {ratio * 100:.0f}%,超過目標 "
+                     f"{(KCAL_OVER_LIMIT - 1) * 100:.0f}% 以上")
+    elif ratio < KCAL_UNDER_LIMIT and r["kcal"] > 0:
+        warns.append(f"PN 熱量僅達目標的 {ratio * 100:.0f}%")
+if maint > 0 and r["volume"] > maint * FLUID_OVER_LIMIT:
+    warns.append(f"總液體量 {r['volume']:,.0f} mL 為維持量的 {fluid_pct:.0f}%,請留意液體過多")
+
 with right:
     st.subheader("計算結果")
     m0a, m0b, m1 = st.columns(3)
-    m0a.metric(f"{elabel} (kcal/d)", f"{ree:,.0f}")
+    m0a.metric("水分量 (mL/d)", f"{r['volume']:,.0f}",
+               f"維持量 {fluid_pct:.0f}%", delta_color="off",
+               help=f"PN + Fat;{r['volume'] / bw:,.0f} mL/kg/day,"
+                    f"Holliday-Segar 維持量 {maint:,.0f} mL/day")
     m0b.metric("熱量需求 (kcal/d)", f"{target_kcal:,.0f}",
                help=f"{elabel} × {stress:g} × {cal_factor:g}")
     m1.metric("PN 熱量 (kcal/d)", f"{r['kcal']:,.0f}",
@@ -232,8 +256,13 @@ with right:
     st.progress(min(pct / 100, 1.0), text=f"達成目標熱量 {pct:.0f}%  "
                                           f"({r['kcal']:,.0f} / {target_kcal:,.0f} kcal)")
 
+    if warns:
+        for w in warns:
+            st.warning("⚠️ " + w)
+    else:
+        st.success("熱量、液體量與 SIR / AA / Fat 皆在建議範圍內")
+
     # 目標範圍對照
-    infant = age < 1
     ref = pd.DataFrame(
         {
             "項目": ["SIR (mg/kg/min)", "AA (g/kg/day)", "Fat (g/kg/day)"],
@@ -276,31 +305,6 @@ st.dataframe(
     hide_index=True,
     use_container_width=True,
 )
-
-# --- 提示 ---
-max_aa = 4.0 if infant else 2.0
-max_fat = 3.0 if infant else 2.0
-warns = []
-if r["sir"] > 14:
-    warns.append(f"SIR {r['sir']:.1f} mg/kg/min 超過上限 12–14")
-if r["aa_kg"] > max_aa:
-    warns.append(f"AA {r['aa_kg']:.2f} g/kg/day 超過上限 {max_aa:g}")
-if r["fat_kg"] > max_fat:
-    warns.append(f"Fat {r['fat_kg']:.2f} g/kg/day 超過上限 {max_fat:g}")
-if target_kcal > 0:
-    ratio = r["kcal"] / target_kcal
-    if ratio > KCAL_OVER_LIMIT:
-        warns.append(f"PN 熱量 {r['kcal']:,.0f} kcal 為目標的 {ratio * 100:.0f}%,超過目標 "
-                     f"{(KCAL_OVER_LIMIT - 1) * 100:.0f}% 以上")
-    elif ratio < KCAL_UNDER_LIMIT and r["kcal"] > 0:
-        warns.append(f"PN 熱量僅達目標的 {ratio * 100:.0f}%")
-if maint > 0 and r["volume"] > maint * FLUID_OVER_LIMIT:
-    warns.append(f"總液體量 {r['volume']:,.0f} mL 為維持量的 {fluid_pct:.0f}%,請留意液體過多")
-if warns:
-    for w in warns:
-        st.warning("⚠️ " + w)
-else:
-    st.success("熱量、液體量與 SIR / AA / Fat 皆在建議範圍內")
 
 st.caption("※ 本工具僅供輔助計算,實際處方請由臨床醫師/營養師確認。")
 st.caption("Neil JJC HMMCH 製作")
