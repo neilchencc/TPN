@@ -153,10 +153,15 @@ st.markdown(
 # --- 病人資料 ---
 st.sidebar.header("病人資料")
 col_age, col_sex = st.sidebar.columns([3, 2])
-age = col_age.number_input("年齡 (歲)", 0.0, 18.0, 10.0, 0.1,
-                           help="嬰兒請用小數,例如 3 個月 = 0.25")
+age_years = col_age.number_input("年齡 (歲)", 0, 18, 10, 1, format="%d",
+                                 help="未滿 1 歲請填 0,再輸入月齡")
 sex = col_sex.radio("性別", ["M", "F"], index=0, horizontal=True)
-bw = st.sidebar.number_input("體重 (kg)", 1.0, 150.0, 34.5, 0.1)
+age = float(age_years)
+if age_years == 0:
+    # 嬰兒公式依月齡區分 (≤3、≤6、≤12 個月),需另外輸入月齡
+    age_months = st.sidebar.number_input("月齡 (月)", 0, 11, 6, 1, format="%d")
+    age = age_months / 12
+bw = float(st.sidebar.number_input("體重 (kg)", 1, 150, 35, 1, format="%d"))
 
 stress_keys = list(STRESS_OPTIONS)
 stress = st.sidebar.selectbox("壓力參數", stress_keys, index=2,
@@ -227,26 +232,19 @@ with right:
     st.progress(min(pct / 100, 1.0), text=f"達成目標熱量 {pct:.0f}%  "
                                           f"({r['kcal']:,.0f} / {target_kcal:,.0f} kcal)")
 
-    # 明細
-    detail = pd.DataFrame(
+    # 目標範圍對照
+    infant = age < 1
+    ref = pd.DataFrame(
         {
-            "成分": ["Dextrose", "Amino acid", "Fat (SMOFlipid)", "合計"],
-            "克數 (g/day)": [r["dex_g"], r["aa_g"], r["fat_g"], None],
-            "熱量 (kcal/day)": [r["kcal_dex"], r["kcal_aa"], r["kcal_fat"], r["kcal"]],
-            "熱量占比 (%)": [
-                100 * r["kcal_dex"] / r["kcal"] if r["kcal"] else 0,
-                100 * r["kcal_aa"] / r["kcal"] if r["kcal"] else 0,
-                100 * r["kcal_fat"] / r["kcal"] if r["kcal"] else 0,
-                100 if r["kcal"] else 0,
-            ],
+            "項目": ["SIR (mg/kg/min)", "AA (g/kg/day)", "Fat (g/kg/day)"],
+            "目前": [round(r["sir"], 2), round(r["aa_kg"], 2), round(r["fat_kg"], 2)],
+            "Initial": ["3 - 4", "1 - 2", "0.5 - 1"],
+            "Increment": ["2 - 5", "1", "0.5"],
+            "Maximum": ["12 - 14", "3 - 4 (infant)" if infant else "2 (child)",
+                        "3 (infant)" if infant else "1 - 2 (child)"],
         }
     )
-    st.dataframe(
-        detail.style.format({"克數 (g/day)": "{:.1f}", "熱量 (kcal/day)": "{:,.0f}",
-                             "熱量占比 (%)": "{:.0f}"}, na_rep="—"),
-        hide_index=True,
-        use_container_width=True,
-    )
+    st.dataframe(ref, hide_index=True, use_container_width=True)
     st.caption(f"熱量需求 = {elabel} {ree:,.0f} × 壓力參數 {stress:g} × 熱量係數 {cal_factor:g}")
     st.caption(f"總液體量 (PN + Fat):{r['volume']:,.0f} mL/day "
                f"({r['volume'] / bw:,.0f} mL/kg/day);"
@@ -257,21 +255,29 @@ with right:
 
 st.divider()
 
-# --- 目標對照與提示 ---
-st.subheader("目標範圍對照")
-infant = age < 1
-ref = pd.DataFrame(
+# --- 熱量明細 (原本在達成目標熱量下方) ---
+st.subheader("熱量明細")
+detail = pd.DataFrame(
     {
-        "項目": ["SIR (mg/kg/min)", "AA (g/kg/day)", "Fat (g/kg/day)"],
-        "目前": [round(r["sir"], 2), round(r["aa_kg"], 2), round(r["fat_kg"], 2)],
-        "Initial": ["3 - 4", "1 - 2", "0.5 - 1"],
-        "Increment": ["2 - 5", "1", "0.5"],
-        "Maximum": ["12 - 14", "3 - 4 (infant)" if infant else "2 (child)",
-                    "3 (infant)" if infant else "1 - 2 (child)"],
+        "成分": ["Dextrose", "Amino acid", "Fat (SMOFlipid)", "合計"],
+        "克數 (g/day)": [r["dex_g"], r["aa_g"], r["fat_g"], None],
+        "熱量 (kcal/day)": [r["kcal_dex"], r["kcal_aa"], r["kcal_fat"], r["kcal"]],
+        "熱量占比 (%)": [
+            100 * r["kcal_dex"] / r["kcal"] if r["kcal"] else 0,
+            100 * r["kcal_aa"] / r["kcal"] if r["kcal"] else 0,
+            100 * r["kcal_fat"] / r["kcal"] if r["kcal"] else 0,
+            100 if r["kcal"] else 0,
+        ],
     }
 )
-st.dataframe(ref, hide_index=True, use_container_width=True)
+st.dataframe(
+    detail.style.format({"克數 (g/day)": "{:.1f}", "熱量 (kcal/day)": "{:,.0f}",
+                         "熱量占比 (%)": "{:.0f}"}, na_rep="—"),
+    hide_index=True,
+    use_container_width=True,
+)
 
+# --- 提示 ---
 max_aa = 4.0 if infant else 2.0
 max_fat = 3.0 if infant else 2.0
 warns = []
