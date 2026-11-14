@@ -490,6 +490,7 @@ def cb_load_record(inputs: dict, created_at: str) -> None:
 def cb_delete_record(rid: int) -> None:
     delete_record(ss.user["id"], rid)
     ss.pop("confirm_del_record", None)  # 對話框保持開啟,可以繼續刪
+    ss.hist_ver = ss.get("hist_ver", 0) + 1  # 重建表格
 
 
 def cb_set(key: str, value) -> None:
@@ -581,6 +582,34 @@ def _age_text(inp: dict) -> str:
     return f"{int(inp['age_years'])} 歲"
 
 
+def _pn_text(inp: dict) -> str:
+    """PN 配方摘要,例: D10/AA2 300 mL、D12.5/AA2 200 mL (只列容量 > 0 的組合)。"""
+    bags = pd.DataFrame(inp.get("bags") or {c: [] for c in BAG_COLS})
+    parts = [
+        f"D{row['Dex (%)']:g}/AA{row['AA (%)']:g} {row['Volume (mL)']:g} mL"
+        for _, row in bags.iterrows() if row["Volume (mL)"] > 0
+    ]
+    return "、".join(parts) if parts else "—"
+
+
+@db_safe
+def cb_history_table(editor_key: str, rec_ids: list, inputs_list: list, whens: list) -> None:
+    """歷史紀錄表格中勾選「載入」或「刪除」時處理。"""
+    edits = ss.get(editor_key, {}).get("edited_rows", {})
+    ss.hist_ver = ss.get("hist_ver", 0) + 1  # 換新表格,勾選框恢復空白
+    for idx, change in edits.items():
+        i = int(idx)
+        if change.get("載入"):
+            ss.pop("confirm_del_record", None)
+            apply_inputs(inputs_list[i])
+            flash("info", f"已載入 {whens[i]} 的紀錄")
+            request_app_rerun()
+            return
+        if change.get("刪除"):
+            ss.confirm_del_record = rec_ids[i]
+            return
+
+
 @st.dialog("歷史紀錄", width="large")
 def history_dialog(pid: int, pname: str) -> None:
     rerun_if_requested()
@@ -591,15 +620,23 @@ def history_dialog(pid: int, pname: str) -> None:
         st.caption("尚無紀錄。調整好配方後,按上方「💾 儲存」即可存檔。")
         return
 
-    rows = []
+    rows, rec_ids, inputs_list, whens = [], [], [], []
     for rec in recs:
         d = json.loads(rec["data"])
         inp, res = d["inputs"], d["results"]
+        when = rec["created_at"][:16]
+        rec_ids.append(rec["id"])
+        inputs_list.append(inp)
+        whens.append(when)
         rows.append({
-            "時間": rec["created_at"][:16],
+            "載入": False,
+            "刪除": False,
+            "時間": when,
             "備註": rec["note"] or "",
             "年齡": _age_text(inp),
             "體重": inp["bw"],
+            "PN 配方 (濃度 / 容量)": _pn_text(inp),
+            "SMOF (mL)": int(inp.get("fat_vol", 0)),
             "PN kcal": round(res["kcal"]),
             "目標": round(res["target_kcal"]),
             "達成%": round(res["pct"]),
@@ -608,43 +645,36 @@ def history_dialog(pid: int, pname: str) -> None:
             "Fat": round(res["fat_kg"], 2),
             "水分": round(res["volume"]),
         })
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    df = pd.DataFrame(rows)
 
-    for rec in recs:
-        d = json.loads(rec["data"])
-        inp, res = d["inputs"], d["results"]
-        when = rec["created_at"][:16]
+    st.caption("勾選「載入」把該筆資料填回計算器;勾選「刪除」後會再確認一次。")
+    editor_key = f"hist_{pid}_{ss.get('hist_ver', 0)}"
+    st.data_editor(
+        df,
+        key=editor_key,
+        hide_index=True,
+        use_container_width=True,
+        num_rows="fixed",
+        disabled=[c for c in df.columns if c not in ("載入", "刪除")],
+        column_config={
+            "載入": st.column_config.CheckboxColumn("載入", width="small"),
+            "刪除": st.column_config.CheckboxColumn("刪除", width="small"),
+            "PN 配方 (濃度 / 容量)": st.column_config.TextColumn(width="large"),
+        },
+        on_change=cb_history_table,
+        args=(editor_key, rec_ids, inputs_list, whens),
+    )
+
+    rid = ss.get("confirm_del_record")
+    if rid in rec_ids:
+        when = whens[rec_ids.index(rid)]
         with st.container(border=True):
-            c1, c2, c3 = st.columns([4, 1, 1], vertical_alignment="center")
-            note = f"　｜{rec['note']}" if rec["note"] else ""
-            c1.markdown(f"**{when}**{note}  \n"
-                        f"PN {res['kcal']:,.0f} / 目標 {res['target_kcal']:,.0f} kcal")
-            if ss.get("confirm_del_record") == rec["id"]:
-                c2.button("確認刪除", type="primary", key=f"rdel_ok_{rec['id']}",
-                          use_container_width=True,
-                          on_click=cb_delete_record, args=(rec["id"],))
-                c3.button("取消", key=f"rdel_no_{rec['id']}", use_container_width=True,
-                          on_click=cb_set, args=("confirm_del_record", None))
-            else:
-                c2.button("載入", key=f"rload_{rec['id']}", use_container_width=True,
-                          on_click=cb_load_record, args=(inp, when))
-                c3.button("🗑 刪除", key=f"rdel_{rec['id']}", use_container_width=True,
-                          on_click=cb_set, args=("confirm_del_record", rec["id"]))
-            with st.expander("詳細內容"):
-                stress_txt = (f"{float(inp['stress_custom']):g} (自訂)" if inp.get("custom")
-                              else f"{float(inp['stress_sel']):g}")
-                st.markdown(
-                    f"**年齡** {_age_text(inp)}　**性別** {inp['sex']}　"
-                    f"**體重** {inp['bw']} kg　**壓力參數** {stress_txt}　"
-                    f"**熱量係數** {float(inp['cal_factor']):g}　"
-                    f"**SMOFlipid** {inp['fat_vol']} mL"
-                )
-                used = pd.DataFrame(inp["bags"])[BAG_COLS]
-                used = used[used["Volume (mL)"] > 0]
-                if len(used):
-                    st.dataframe(used, hide_index=True, use_container_width=True)
-                else:
-                    st.caption("(未使用 PN 袋)")
+            st.warning(f"確定要刪除 {when} 的紀錄?刪除後無法復原。")
+            c1, c2, _ = st.columns([1, 1, 3])
+            c1.button("確認刪除", type="primary", key=f"rdel_ok_{rid}",
+                      use_container_width=True, on_click=cb_delete_record, args=(rid,))
+            c2.button("取消", key=f"rdel_no_{rid}", use_container_width=True,
+                      on_click=cb_set, args=("confirm_del_record", None))
 
 
 # 套用上一個動作排定的輸入值 (必須在任何輸入欄位建立之前)
