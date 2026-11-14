@@ -934,6 +934,9 @@ def history_dialog(target: tuple, label: str) -> None:
             for c, name in zip(cells[2:], cols):
                 c.markdown(_cell(r[name]), unsafe_allow_html=True)
 
+    st.caption("**單位**:SIR mg/kg/min ｜ AA g/kg/day ｜ Fat g/kg/day ｜ "
+               "水分 mL/day (PN + Fat)")
+
     rid = ss.get("confirm_del_record")
     ids = [r["_id"] for r in rows]
     if rid in ids:
