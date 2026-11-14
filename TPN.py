@@ -18,6 +18,7 @@ TPN / PN 計算器 (Streamlit)
 import base64
 import hashlib
 import hmac
+import html
 import json
 import secrets
 import functools
@@ -490,7 +491,6 @@ def cb_load_record(inputs: dict, created_at: str) -> None:
 def cb_delete_record(rid: int) -> None:
     delete_record(ss.user["id"], rid)
     ss.pop("confirm_del_record", None)  # 對話框保持開啟,可以繼續刪
-    ss.hist_ver = ss.get("hist_ver", 0) + 1  # 重建表格
 
 
 def cb_set(key: str, value) -> None:
@@ -592,22 +592,15 @@ def _pn_text(inp: dict) -> str:
     return "、".join(parts) if parts else "—"
 
 
-@db_safe
-def cb_history_table(editor_key: str, rec_ids: list, inputs_list: list, whens: list) -> None:
-    """歷史紀錄表格中勾選「載入」或「刪除」時處理。"""
-    edits = ss.get(editor_key, {}).get("edited_rows", {})
-    ss.hist_ver = ss.get("hist_ver", 0) + 1  # 換新表格,勾選框恢復空白
-    for idx, change in edits.items():
-        i = int(idx)
-        if change.get("載入"):
-            ss.pop("confirm_del_record", None)
-            apply_inputs(inputs_list[i])
-            flash("info", f"已載入 {whens[i]} 的紀錄")
-            request_app_rerun()
-            return
-        if change.get("刪除"):
-            ss.confirm_del_record = rec_ids[i]
-            return
+def _text_width(text) -> int:
+    """估計文字寬度:中文等全形字算 2,英數算 1。"""
+    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in str(text))
+
+
+def _cell(text, header: bool = False) -> str:
+    weight = "font-weight:600;" if header else ""
+    return (f"<div style='text-align:center; {weight} font-size:0.9rem; "
+            f"line-height:1.4; word-break:break-word;'>{text}</div>")
 
 
 @st.dialog("歷史紀錄", width="large")
@@ -620,53 +613,70 @@ def history_dialog(pid: int, pname: str) -> None:
         st.caption("尚無紀錄。調整好配方後,按上方「💾 儲存」即可存檔。")
         return
 
-    rows, rec_ids, inputs_list, whens = [], [], [], []
+    rows = []
     for rec in recs:
         d = json.loads(rec["data"])
         inp, res = d["inputs"], d["results"]
         when = rec["created_at"][:16]
-        rec_ids.append(rec["id"])
-        inputs_list.append(inp)
-        whens.append(when)
         rows.append({
-            "載入": False,
-            "刪除": False,
+            "_id": rec["id"],
+            "_inp": inp,
             "時間": when,
-            "備註": rec["note"] or "",
+            "備註": html.escape(rec["note"] or "") or "—",
             "年齡": _age_text(inp),
-            "體重": inp["bw"],
-            "PN 配方 (濃度 / 容量)": _pn_text(inp),
-            "SMOF (mL)": int(inp.get("fat_vol", 0)),
-            "PN kcal": round(res["kcal"]),
-            "目標": round(res["target_kcal"]),
-            "達成%": round(res["pct"]),
-            "SIR": round(res["sir"], 2),
-            "AA": round(res["aa_kg"], 2),
-            "Fat": round(res["fat_kg"], 2),
-            "水分": round(res["volume"]),
+            "體重": f"{inp['bw']}",
+            "PN 配方": _pn_text(inp),
+            "SMOF (mL)": f"{int(inp.get('fat_vol', 0))}",
+            "PN kcal": f"{res['kcal']:,.0f}",
+            "目標": f"{res['target_kcal']:,.0f}",
+            "達成%": f"{res['pct']:.0f}",
+            "SIR": f"{res['sir']:.2f}",
+            "AA": f"{res['aa_kg']:.2f}",
+            "Fat": f"{res['fat_kg']:.2f}",
+            "水分": f"{res['volume']:,.0f}",
         })
-    df = pd.DataFrame(rows)
+    cols = [c for c in rows[0] if not c.startswith("_")]
 
-    st.caption("勾選「載入」把該筆資料填回計算器;勾選「刪除」後會再確認一次。")
-    editor_key = f"hist_{pid}_{ss.get('hist_ver', 0)}"
-    st.data_editor(
-        df,
-        key=editor_key,
-        hide_index=True,
-        num_rows="fixed",
-        disabled=[c for c in df.columns if c not in ("載入", "刪除")],
-        # 不指定欄寬、不撐滿畫面:每欄自動配合欄名或內容的寬度
-        column_config={
-            "載入": st.column_config.CheckboxColumn("載入"),
-            "刪除": st.column_config.CheckboxColumn("刪除"),
-        },
-        on_change=cb_history_table,
-        args=(editor_key, rec_ids, inputs_list, whens),
+    # 欄寬 = 欄名與內容中最寬的那個 (按鈕欄給固定寬度)
+    widths = [6, 6] + [
+        max(_text_width(c), *(_text_width(r[c]) for r in rows)) + 2 for c in cols
+    ]
+
+    # 每一列底下加細線
+    st.markdown(
+        """
+        <style>
+        [class*="st-key-hrow_"] {
+            border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+            padding: 0.15rem 0;
+        }
+        [class*="st-key-hrow_"] p { margin: 0; }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
+    with st.container(key="hrow_header"):
+        hdr = st.columns(widths, gap="small", vertical_alignment="center")
+        for c, name in zip(hdr, ["載入", "刪除"] + cols):
+            c.markdown(_cell(name, header=True), unsafe_allow_html=True)
+
+    for r in rows:
+        rid = r["_id"]
+        with st.container(key=f"hrow_{rid}"):
+            cells = st.columns(widths, gap="small", vertical_alignment="center")
+            cells[0].button("載入", key=f"rload_{rid}", use_container_width=True,
+                            on_click=cb_load_record, args=(r["_inp"], r["時間"]))
+            cells[1].button("🗑", key=f"rdel_{rid}", use_container_width=True,
+                            help="刪除這筆紀錄",
+                            on_click=cb_set, args=("confirm_del_record", rid))
+            for c, name in zip(cells[2:], cols):
+                c.markdown(_cell(r[name]), unsafe_allow_html=True)
+
     rid = ss.get("confirm_del_record")
-    if rid in rec_ids:
-        when = whens[rec_ids.index(rid)]
+    ids = [r["_id"] for r in rows]
+    if rid in ids:
+        when = rows[ids.index(rid)]["時間"]
         with st.container(border=True):
             st.warning(f"確定要刪除 {when} 的紀錄?刪除後無法復原。")
             c1, c2, _ = st.columns([1, 1, 3])
