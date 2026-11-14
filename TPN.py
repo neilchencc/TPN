@@ -20,6 +20,8 @@ import hashlib
 import hmac
 import json
 import secrets
+import functools
+import os
 import sqlite3
 import tempfile
 from contextlib import closing
@@ -123,17 +125,29 @@ DEFAULT_BAGS = pd.DataFrame(
 # ----------------------------------------------------------------------
 # 資料庫 (SQLite): 帳號、病患、紀錄
 # ----------------------------------------------------------------------
+DB_FILENAME = "tpn_calc.db"
+
+
 def _pick_db_path() -> Path:
-    """找一個可以寫入的位置放資料庫。
-    Streamlit Cloud 上程式所在資料夾可能是唯讀的,寫不進去就改放家目錄或暫存資料夾。"""
-    candidates = [Path(__file__).parent, Path.home(), Path(tempfile.gettempdir())]
+    """找一個可以正常寫入的位置放資料庫。
+    Streamlit Cloud 的程式資料夾 (/mount/src/...) 是掛載的檔案系統,SQLite 在上面可能無法寫入,
+    所以優先放家目錄或暫存資料夾,最後才試程式資料夾。
+    可用環境變數 TPN_DB_DIR 指定資料夾。"""
+    candidates = []
+    if os.environ.get("TPN_DB_DIR"):
+        candidates.append(Path(os.environ["TPN_DB_DIR"]))
+    candidates += [Path.home() / ".tpn_calc", Path(tempfile.gettempdir()) / "tpn_calc",
+                   Path(__file__).parent]
     for folder in candidates:
-        path = folder / "tpn_data.db"
+        path = folder / DB_FILENAME
         try:
-            with closing(sqlite3.connect(path)) as c, c:
-                c.execute("CREATE TABLE IF NOT EXISTS _write_test (x INTEGER)")
-                c.execute("INSERT INTO _write_test VALUES (1)")
-                c.execute("DROP TABLE _write_test")
+            folder.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(path)) as c:
+                # 模擬實際寫入 (含 journal 檔),測完 rollback 不留痕跡
+                c.execute("BEGIN IMMEDIATE")
+                c.execute("CREATE TABLE IF NOT EXISTS _write_test (x TEXT)")
+                c.execute("INSERT INTO _write_test VALUES ('ok')")
+                c.rollback()
             return path
         except (sqlite3.Error, OSError):
             continue
@@ -347,7 +361,25 @@ def rerun_if_requested() -> None:
         st.rerun()
 
 
+def db_safe(func):
+    """資料庫出錯時不讓整個 app 當掉,改把真正的錯誤訊息顯示在畫面上。"""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except sqlite3.Error as e:
+            ss._db_err = f"資料庫錯誤 ({type(e).__name__}):{e}\n\n資料庫位置:{DB_PATH}"
+    return wrapper
+
+
+def show_db_error() -> None:
+    err = ss.pop("_db_err", None)
+    if err:
+        st.error(err)
+
+
 # --- callbacks: 帳號 ---
+@db_safe
 def cb_login() -> None:
     user = verify_user(ss.get("li_user", ""), ss.get("li_pw", ""))
     if not user:
@@ -363,6 +395,7 @@ def cb_login() -> None:
     request_app_rerun()
 
 
+@db_safe
 def cb_register() -> None:
     u, p, p2 = ss.get("rg_user", ""), ss.get("rg_pw", ""), ss.get("rg_pw2", "")
     if p != p2:
@@ -378,6 +411,7 @@ def cb_register() -> None:
     request_app_rerun()
 
 
+@db_safe
 def cb_logout() -> None:
     for k in ["user", "patient_id", "confirm_del_patient", "confirm_del_record"]:
         ss.pop(k, None)
@@ -386,10 +420,12 @@ def cb_logout() -> None:
 
 
 # --- callbacks: 病患 ---
+@db_safe
 def cb_select_patient() -> None:
     load_latest(ss.patient_id)
 
 
+@db_safe
 def cb_add_patient() -> None:
     name = ss.get("new_patient_name", "").strip()
     if not name:
@@ -406,12 +442,14 @@ def cb_add_patient() -> None:
     request_app_rerun()
 
 
+@db_safe
 def cb_choose_patient(pid: int) -> None:
     ss.patient_id = pid
     load_latest(pid)
     request_app_rerun()
 
 
+@db_safe
 def cb_delete_patient(pid: int, name: str) -> None:
     delete_patient(ss.user["id"], pid)
     ss.pop("confirm_del_patient", None)
@@ -422,6 +460,7 @@ def cb_delete_patient(pid: int, name: str) -> None:
 
 
 # --- callbacks: 紀錄 ---
+@db_safe
 def cb_save_record(pid: int, payload: dict) -> None:
     note = ss.get("note", "").strip()
     if add_record(ss.user["id"], pid, note, payload):
@@ -432,12 +471,14 @@ def cb_save_record(pid: int, payload: dict) -> None:
     request_app_rerun()
 
 
+@db_safe
 def cb_load_record(inputs: dict, created_at: str) -> None:
     apply_inputs(inputs)
     flash("info", f"已載入 {created_at} 的紀錄")
     request_app_rerun()
 
 
+@db_safe
 def cb_delete_record(rid: int) -> None:
     delete_record(ss.user["id"], rid)
     ss.pop("confirm_del_record", None)  # 對話框保持開啟,可以繼續刪
@@ -453,6 +494,7 @@ def cb_set(key: str, value) -> None:
 @st.dialog("登入 / 註冊")
 def auth_dialog() -> None:
     rerun_if_requested()
+    show_db_error()
     err = ss.pop("_auth_err", None)
     if err:
         st.error(err)
@@ -475,6 +517,7 @@ def auth_dialog() -> None:
 @st.dialog("管理病患")
 def patients_dialog() -> None:
     rerun_if_requested()
+    show_db_error()
     with st.form("new_patient_form", border=False):
         c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
         c1.text_input("新增病患", key="new_patient_name", max_chars=50,
@@ -511,6 +554,7 @@ def patients_dialog() -> None:
 @st.dialog("儲存紀錄")
 def save_dialog(pid: int, pname: str, payload: dict) -> None:
     rerun_if_requested()
+    show_db_error()
     res, inp = payload["results"], payload["inputs"]
     st.markdown(f"病患:**{pname}**")
     st.caption(
@@ -532,6 +576,7 @@ def _age_text(inp: dict) -> str:
 @st.dialog("歷史紀錄", width="large")
 def history_dialog(pid: int, pname: str) -> None:
     rerun_if_requested()
+    show_db_error()
     st.markdown(f"病患:**{pname}**")
     recs = list_records(ss.user["id"], pid)
     if not recs:
@@ -699,6 +744,8 @@ with st.container(key="app_header"):
             with c_user.popover("👤", use_container_width=True):
                 st.markdown(f"**{user['username']}**")
                 st.button("登出", on_click=cb_logout, use_container_width=True)
+
+show_db_error()
 
 # ----------------------------------------------------------------------
 # 側邊欄: 病人資料
