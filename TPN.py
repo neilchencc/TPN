@@ -740,12 +740,33 @@ _header_bg = "#0e1117" if _dark else "#ffffff"
 st.markdown(
     f"""
     <style>
+    /* 標題列右側: 全部排成一排不換行,按鈕寬度配合文字 */
+    .st-key-hdr_ctrl [data-testid="stHorizontalBlock"] {{
+        flex-wrap: nowrap !important;
+        justify-content: flex-end;
+        align-items: center;
+        gap: 0.5rem;
+    }}
+    .st-key-hdr_ctrl [data-testid="stColumn"],
+    .st-key-hdr_ctrl [data-testid="column"] {{
+        flex: 0 0 auto !important;
+        width: auto !important;
+        min-width: 0 !important;
+    }}
+    /* 提示文字欄: 佔用剩下的空間,文字靠右 (緊貼病患選單左邊) */
+    .st-key-hdr_ctrl [data-testid="stColumn"]:has(.st-key-notice),
+    .st-key-hdr_ctrl [data-testid="column"]:has(.st-key-notice) {{
+        flex: 1 1 auto !important;
+        min-width: 0 !important;
+        overflow: hidden;
+    }}
     /* 病患選單欄寬: 約 5 個英數 + 4 個中文字 */
-    [data-testid="stColumn"]:has(.st-key-pat_sel) {{
+    .st-key-hdr_ctrl [data-testid="stColumn"]:has(.st-key-pat_sel),
+    .st-key-hdr_ctrl [data-testid="column"]:has(.st-key-pat_sel) {{
         flex: 0 0 10rem !important;
         width: 10rem !important;
-        min-width: 10rem !important;
     }}
+    .st-key-hdr_ctrl button {{ white-space: nowrap; }}
     .st-key-app_header {{
         position: sticky;
         top: 0;
@@ -761,13 +782,33 @@ st.markdown(
 
 # 顯示 callback 留下的訊息
 _ICONS = {"success": "✅", "error": "⚠️", "info": "ℹ️"}
-_timed_notes = []  # 有秒數的提示放到頁面最後再畫 (固定在右上角,不佔版面)
-for _kind, _msg, _sec in ss.flash:
-    if _sec:
-        _timed_notes.append((_kind, _msg, _sec))
-    else:
-        st.toast(_msg, icon=_ICONS.get(_kind))
+_notes = ss.flash  # 提示文字統一顯示在標題列 (病患選單左邊)
 ss.flash = []
+
+NOTE_SECONDS = 3  # 一般提示顯示秒數 (有指定秒數者依指定,例如儲存 1 秒)
+
+
+def render_notes(notes: list) -> None:
+    """在目前位置顯示提示文字 (靠右對齊),數秒後淡出。"""
+    parts = []
+    for kind, msg, sec in notes:
+        ss._note_n = ss.get("_note_n", 0) + 1  # 每次用新的動畫名稱,確保動畫重新播放
+        anim = f"tpnFade{ss._note_n}"
+        fg, bg = ("#b42318", "#fde4e1") if kind == "error" else ("#177233", "#dff3e4")
+        parts.append(
+            f"<style>@keyframes {anim} {{ 0%, 85% {{ opacity: 1; }} "
+            f"100% {{ opacity: 0; visibility: hidden; }} }}</style>"
+            f"<span style='display:inline-block; padding:0.35rem 0.8rem; "
+            f"border-radius:0.5rem; font-size:0.9rem; font-weight:600; white-space:nowrap; "
+            f"color:{fg}; background:{bg}; animation:{anim} {sec or NOTE_SECONDS}s forwards;'>"
+            f"{_ICONS.get(kind, '')} {html.escape(msg)}</span>"
+        )
+    st.markdown(
+        "<div style='display:flex; justify-content:flex-end; gap:0.4rem; "
+        "overflow:hidden; min-height:2.5rem; align-items:center;'>"
+        + "".join(parts) + "</div>",
+        unsafe_allow_html=True,
+    )
 
 # --- 登入狀態與病患清單 ---
 user = ss.get("user")
@@ -790,15 +831,20 @@ with st.container(key="app_header"):
         f"flex-wrap:wrap;'>{logo_html}靜脈營養計算器</h1>",
         unsafe_allow_html=True,
     )
-    with h_ctrl:
+    with h_ctrl.container(key="hdr_ctrl"):
+        # 一排靠右: [提示文字] [病患選單] [儲存] [紀錄] [帳號]
         if not user:
-            _, c_login = st.columns([3, 1.5])
-            if c_login.button("🔑 登入 / 註冊", use_container_width=True,
+            c_note, c_login = st.columns(2, vertical_alignment="center")
+            with c_note.container(key="notice"):
+                render_notes(_notes)
+            if c_login.button("🔑 登入 / 註冊",
                               help="登入後可建立病患、儲存與查看歷史紀錄"):
                 dialog_to_open = "auth"
         else:
-            c_pat, c_save, c_hist, c_acct = st.columns(
-                [1, 1, 1, 1], vertical_alignment="center")
+            c_note, c_pat, c_save, c_hist, c_acct = st.columns(
+                5, vertical_alignment="center")
+            with c_note.container(key="notice"):
+                render_notes(_notes)
             with c_pat.container(key="pat_sel"):  # 寬度由 CSS 固定 (約 5 英數 + 4 中文)
                 if patients:
                     st.selectbox("目前病患", list(patients),
@@ -807,14 +853,14 @@ with st.container(key="app_header"):
                                  label_visibility="collapsed")
                 else:
                     st.caption("尚無病患")
-            if c_save.button("💾 儲存", disabled=not pid, use_container_width=True,
+            if c_save.button("💾 儲存", disabled=not pid,
                              help="把目前輸入的資料存到這位病患"):
                 dialog_to_open = "save"
-            if c_hist.button("🕘 紀錄", disabled=not pid, use_container_width=True,
+            if c_hist.button("🕘 紀錄", disabled=not pid,
                              help="查看、載入或刪除歷史紀錄"):
                 dialog_to_open = "history"
             # 病患管理與登出整合成一個按鈕
-            with c_acct.popover("👤 帳號", use_container_width=True):
+            with c_acct.popover("👤 帳號"):
                 st.caption(f"登入身分:**{user['username']}**")
                 if st.button("👥 新增 / 管理病患", use_container_width=True):
                     dialog_to_open = "patients"
@@ -1040,26 +1086,3 @@ elif dialog_to_open == "save" and pid:
             "fluid_pct": float(fluid_pct),
         },
     })
-
-# --- 短暫提示 (例如「已儲存紀錄」顯示 1 秒後消失) ---
-for _kind, _msg, _sec in _timed_notes:
-    ss._note_n = ss.get("_note_n", 0) + 1  # 每次用新的動畫名稱,確保動畫重新播放
-    _anim = f"tpnFade{ss._note_n}"
-    _fg, _bg = ("#b42318", "#fde4e1") if _kind == "error" else ("#177233", "#dff3e4")
-    st.markdown(
-        f"""
-        <style>
-        @keyframes {_anim} {{
-            0%, 85% {{ opacity: 1; }}
-            100% {{ opacity: 0; visibility: hidden; }}
-        }}
-        </style>
-        <div style="position:fixed; top:4.5rem; right:1.5rem; z-index:100000;
-                    padding:0.6rem 1.1rem; border-radius:0.5rem; font-weight:600;
-                    color:{_fg}; background:{_bg}; box-shadow:0 4px 12px rgba(0,0,0,0.15);
-                    pointer-events:none; animation:{_anim} {_sec}s forwards;">
-            {_ICONS.get(_kind, "")} {_msg}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
