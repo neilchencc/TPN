@@ -19,6 +19,7 @@ import hmac
 import json
 import secrets
 import sqlite3
+import tempfile
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
@@ -120,7 +121,24 @@ DEFAULT_BAGS = pd.DataFrame(
 # ----------------------------------------------------------------------
 # 資料庫 (SQLite): 帳號、病患、紀錄
 # ----------------------------------------------------------------------
-DB_PATH = Path(__file__).parent / "tpn_data.db"
+def _pick_db_path() -> Path:
+    """找一個可以寫入的位置放資料庫。
+    Streamlit Cloud 上程式所在資料夾可能是唯讀的,寫不進去就改放家目錄或暫存資料夾。"""
+    candidates = [Path(__file__).parent, Path.home(), Path(tempfile.gettempdir())]
+    for folder in candidates:
+        path = folder / "tpn_data.db"
+        try:
+            with closing(sqlite3.connect(path)) as c, c:
+                c.execute("CREATE TABLE IF NOT EXISTS _write_test (x INTEGER)")
+                c.execute("INSERT INTO _write_test VALUES (1)")
+                c.execute("DROP TABLE _write_test")
+            return path
+        except (sqlite3.Error, OSError):
+            continue
+    raise RuntimeError("找不到可寫入的位置來存放資料庫")
+
+
+DB_PATH = _pick_db_path()
 MIN_LEN = 4  # 帳號、密碼最少字數
 PBKDF2_ROUNDS = 200_000
 
