@@ -6,9 +6,21 @@ TPN / PN 計算器 (Streamlit)
   - PN 熱量 = Dex(g) x 3.4 + AA(g) x 4 + SMOFlipid 20%(mL) x 2
   - SIR (mg/kg/min) = Dex(g) x 1000 / 1440 / BW
   - AA、Fat (g/kg/day)
+帳號 / 床位:
+  - 左側欄可註冊、登入帳號 (密碼以 PBKDF2-SHA256 + salt 雜湊儲存)
+  - 登入後可新增 / 更名 / 移除床位 (病患),並儲存該床位的輸入資料
+  - 資料存於與本檔同資料夾的 tpn_data.db (SQLite)
 執行: streamlit run streamlit_app.py
 """
 import base64
+import hashlib
+import hmac
+import json
+import math
+import secrets
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -26,14 +38,12 @@ FAT_KCAL_PER_ML = 2.0
 # 警示門檻
 KCAL_OVER_LIMIT = 1.10   # PN 熱量超過目標 110% 提醒
 KCAL_UNDER_LIMIT = 0.90  # 低於目標 90% 提醒
-FLUID_OVER_LIMIT = 1.10   # 總液體量超過維持量 110% 提醒 (紅底)
-FLUID_UNDER_LIMIT = 0.90  # 低於維持量 90% 提醒 (紅底);介於兩者之間為綠底
+FLUID_OVER_LIMIT = 1.10  # 總液體量超過維持量 110% 提醒
 
-# 壓力參數: 選單只顯示數值,說明另外列在選單下方
 STRESS_OPTIONS = {
-    1.3: "營養良好、臥床、輕~中度壓力",
-    1.5: "正常活動且輕~中度壓力 / 臥床但重度壓力 / 低活動且營養不良需追趕",
-    1.7: "活動量大需追趕生長 / 活動量大且重度壓力",
+    "1.3 — 營養良好、臥床、輕~中度壓力": 1.3,
+    "1.5 — 正常活動且輕~中度壓力 / 臥床但重度壓力 / 低活動且營養不良需追趕": 1.5,
+    "1.7 — 活動量大需追趕生長 / 活動量大且重度壓力": 1.7,
 }
 
 
@@ -99,6 +109,307 @@ DEFAULT_BAGS = pd.DataFrame(
 ).astype(float)
 
 # ----------------------------------------------------------------------
+# 帳號 / 床位資料庫 (SQLite)
+# ----------------------------------------------------------------------
+DB_PATH = Path(__file__).parent / "tpn_data.db"
+PBKDF2_ITER = 200_000
+
+
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS users (
+                        username TEXT PRIMARY KEY,
+                        salt     TEXT NOT NULL,
+                        pw_hash  TEXT NOT NULL,
+                        created  TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS beds (
+                        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT NOT NULL
+                                 REFERENCES users(username) ON DELETE CASCADE,
+                        name     TEXT NOT NULL,
+                        data     TEXT NOT NULL,
+                        updated  TEXT,
+                        UNIQUE (username, name))""")
+
+
+def _hash_pw(pw: str, salt_hex: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt_hex),
+                               PBKDF2_ITER).hex()
+
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def create_user(username: str, pw: str):
+    """成功回傳 None,失敗回傳錯誤訊息。"""
+    salt = secrets.token_hex(16)
+    try:
+        with db() as c:
+            c.execute("INSERT INTO users VALUES (?, ?, ?, ?)",
+                      (username, salt, _hash_pw(pw, salt), _now()))
+    except sqlite3.IntegrityError:
+        return "此帳號已存在"
+    return None
+
+
+def verify_user(username: str, pw: str) -> bool:
+    with db() as c:
+        row = c.execute("SELECT salt, pw_hash FROM users WHERE username = ?",
+                        (username,)).fetchone()
+    if not row:
+        return False
+    return hmac.compare_digest(_hash_pw(pw, row[0]), row[1])
+
+
+def list_beds(username: str) -> list:
+    with db() as c:
+        return c.execute("SELECT id, name FROM beds WHERE username = ? "
+                         "ORDER BY name COLLATE NOCASE", (username,)).fetchall()
+
+
+def get_bed(username: str, bed_id: int):
+    with db() as c:
+        row = c.execute("SELECT data FROM beds WHERE id = ? AND username = ?",
+                        (bed_id, username)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def add_bed(username: str, name: str, data: dict) -> int:
+    with db() as c:
+        cur = c.execute("INSERT INTO beds (username, name, data, updated) "
+                        "VALUES (?, ?, ?, ?)",
+                        (username, name, json.dumps(data, ensure_ascii=False), _now()))
+        return cur.lastrowid
+
+
+def rename_bed(username: str, bed_id: int, name: str):
+    with db() as c:
+        c.execute("UPDATE beds SET name = ?, updated = ? WHERE id = ? AND username = ?",
+                  (name, _now(), bed_id, username))
+
+
+def delete_bed(username: str, bed_id: int):
+    with db() as c:
+        c.execute("DELETE FROM beds WHERE id = ? AND username = ?", (bed_id, username))
+
+
+def save_bed(username: str, bed_id: int, data: dict):
+    with db() as c:
+        c.execute("UPDATE beds SET data = ?, updated = ? WHERE id = ? AND username = ?",
+                  (json.dumps(data, ensure_ascii=False), _now(), bed_id, username))
+
+
+# ----------------------------------------------------------------------
+# 表單狀態 (載入 / 儲存床位用)
+# ----------------------------------------------------------------------
+STRESS_KEYS = list(STRESS_OPTIONS)
+DEFAULT_FORM = {
+    "age": 10.0,
+    "sex": "M",
+    "bw": 34.5,
+    "stress_label": STRESS_KEYS[2],
+    "custom": False,
+    "stress_custom": 1.7,
+    "cal_factor": 0.85,
+    "fat_vol": 400.0,
+}
+BAG_COLS = list(DEFAULT_BAGS.columns)
+ss = st.session_state
+
+
+def editor_key() -> str:
+    return f"bags_{ss.bags_ver}"
+
+
+def apply_form(data: dict):
+    """把床位資料 (或預設值) 填入各輸入欄位。須在 widget 建立前呼叫 (callback 內)。"""
+    for k, v in DEFAULT_FORM.items():
+        ss[k] = data.get(k, v)
+    if ss.stress_label not in STRESS_OPTIONS:
+        ss.stress_label = DEFAULT_FORM["stress_label"]
+    if ss.sex not in ("M", "F"):
+        ss.sex = "M"
+    bags = data.get("bags")
+    df = pd.DataFrame(bags, columns=BAG_COLS) if bags else DEFAULT_BAGS.copy()
+    ss.bags_df = df.astype(float)
+    ss.bags_ver = ss.get("bags_ver", 0) + 1  # 換新 key,讓 data_editor 重新載入
+
+
+def current_bags() -> pd.DataFrame:
+    """依 data_editor 的編輯紀錄還原目前表格 (可在 data_editor 繪製前取得)。"""
+    df = ss.bags_df.copy().reset_index(drop=True)
+    delta = ss.get(editor_key())
+    if not delta:
+        return df
+    for idx, changes in delta.get("edited_rows", {}).items():
+        for col, val in changes.items():
+            if col in df.columns:
+                df.loc[int(idx), col] = val
+    deleted = [int(i) for i in delta.get("deleted_rows", [])]
+    if deleted:
+        df = df.drop(index=deleted, errors="ignore")
+    added = delta.get("added_rows", [])
+    if added:
+        df = pd.concat([df, pd.DataFrame(added, columns=BAG_COLS)], ignore_index=True)
+    return df.reset_index(drop=True)
+
+
+def _num(v):
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(f) else round(f, 6)
+
+
+def form_snapshot(bags: pd.DataFrame) -> dict:
+    data = {k: ss[k] for k in DEFAULT_FORM}
+    for k in ("age", "bw", "stress_custom", "cal_factor", "fat_vol"):
+        data[k] = _num(data[k])
+    data["custom"] = bool(data["custom"])
+    data["bags"] = [{c: _num(row.get(c)) for c in BAG_COLS}
+                    for row in bags.to_dict("records")]
+    return data
+
+
+def flash(kind: str, msg: str):
+    ss.flash = (kind, msg)
+
+
+# ---- callbacks (在 widget 建立前執行,可安全修改欄位值) ----
+def cb_login():
+    u, pw = ss.login_user.strip(), ss.login_pw
+    if verify_user(u, pw):
+        ss.user = u
+        ss.bed_sel = None
+        ss.saved_snapshot = None
+        flash("success", f"歡迎,{u}")
+    else:
+        flash("error", "帳號或密碼錯誤")
+    ss.login_pw = ""
+
+
+def cb_register():
+    u, pw, pw2 = ss.reg_user.strip(), ss.reg_pw, ss.reg_pw2
+    if len(u) < 3:
+        flash("error", "帳號至少 3 個字元")
+    elif len(pw) < 6:
+        flash("error", "密碼至少 6 個字元")
+    elif pw != pw2:
+        flash("error", "兩次密碼不一致")
+    else:
+        err = create_user(u, pw)
+        if err:
+            flash("error", err)
+        else:
+            ss.user = u
+            ss.bed_sel = None
+            ss.saved_snapshot = None
+            ss.reg_user = ""
+            flash("success", f"帳號 {u} 已建立並登入")
+    ss.reg_pw = ss.reg_pw2 = ""
+
+
+def cb_logout():
+    ss.user = None
+    ss.bed_sel = None
+    ss.saved_snapshot = None
+    apply_form({})
+    flash("info", "已登出")
+
+
+def cb_select_bed():
+    bid = ss.bed_sel
+    if bid is None:
+        ss.saved_snapshot = None
+        return
+    data = get_bed(ss.user, bid)
+    if data is None:
+        ss.bed_sel = None
+        flash("error", "找不到該床位")
+        return
+    apply_form(data)
+    ss.saved_snapshot = form_snapshot(ss.bags_df)
+    ss.rename_name = dict(list_beds(ss.user)).get(bid, "")
+
+
+def cb_add_bed():
+    name = ss.new_bed_name.strip()
+    if not name:
+        flash("error", "請輸入床位名稱")
+        return
+    if not ss.get("copy_current"):
+        apply_form({})
+    data = form_snapshot(current_bags())
+    try:
+        bid = add_bed(ss.user, name, data)
+    except sqlite3.IntegrityError:
+        flash("error", f"床位「{name}」已存在")
+        return
+    if ss.get("copy_current"):
+        # 以目前畫面建立:把編輯中的表格固定為新床位的內容
+        apply_form(data)
+    ss.bed_sel = bid
+    ss.saved_snapshot = data
+    ss.rename_name = name
+    ss.new_bed_name = ""
+    flash("success", f"已新增床位「{name}」")
+
+
+def cb_rename_bed():
+    name = ss.rename_name.strip()
+    if not name or ss.bed_sel is None:
+        flash("error", "請輸入新名稱")
+        return
+    try:
+        rename_bed(ss.user, ss.bed_sel, name)
+    except sqlite3.IntegrityError:
+        flash("error", f"床位「{name}」已存在")
+        return
+    flash("success", f"已更名為「{name}」")
+
+
+def cb_delete_bed():
+    if ss.bed_sel is None:
+        return
+    name = dict(list_beds(ss.user)).get(ss.bed_sel, "")
+    delete_bed(ss.user, ss.bed_sel)
+    ss.bed_sel = None
+    ss.saved_snapshot = None
+    ss.del_confirm = False
+    apply_form({})
+    flash("success", f"已移除床位「{name}」")
+
+
+def cb_save():
+    if ss.bed_sel is None:
+        return
+    data = form_snapshot(current_bags())
+    save_bed(ss.user, ss.bed_sel, data)
+    ss.saved_snapshot = data
+    flash("success", f"已儲存 ({datetime.now():%H:%M:%S})")
+
+
+def cb_custom_toggle():
+    if ss.custom:
+        ss.stress_custom = STRESS_OPTIONS[ss.stress_label]
+
+
+# ----------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------
 _logo = Path(__file__).parent / "logo.png"
@@ -127,52 +438,105 @@ if LOGO_PATH.exists():
     logo_b64 = base64.b64encode(LOGO_PATH.read_bytes()).decode()
     logo_html = (f"<img src='data:image/png;base64,{logo_b64}' "
                  "style='height:64px; vertical-align:middle; margin-right:12px;'>")
-# 標題列固定在畫面上方: 主畫面往下捲動時 logo 與標題不動
-try:
-    _dark = st.context.theme.type == "dark"  # Streamlit >= 1.46
-except Exception:
-    _dark = False
-_header_bg = "#0e1117" if _dark else "#ffffff"
 st.markdown(
-    f"""
-    <style>
-    [data-testid="stElementContainer"]:has(.app-title),
-    .element-container:has(.app-title) {{
-        position: sticky;
-        top: 0;
-        z-index: 999;
-        background-color: {_header_bg};
-        padding-bottom: 0.25rem;
-        border-bottom: 1px solid rgba(128, 128, 128, 0.25);
-    }}
-    </style>
-    <h1 class='app-title' style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>{logo_html}靜脈營養計算器</h1>
-    """,
+    f"<h1 style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>"
+    f"{logo_html}靜脈營養計算器</h1>",
     unsafe_allow_html=True,
 )
 
+# --- 狀態初始化 ---
+init_db()
+if "user" not in ss:
+    ss.user = None
+    ss.bed_sel = None
+    ss.saved_snapshot = None
+    apply_form({})
+# 未顯示的 widget (例如未勾選自訂壓力參數時) 其值會被 Streamlit 清掉,
+# 每次執行前重新指定一次以保留。
+for _k, _v in DEFAULT_FORM.items():
+    ss[_k] = ss.get(_k, _v)
+
+# --- 帳號 / 床位 ---
+with st.sidebar:
+    if "flash" in ss:
+        kind, msg = ss.pop("flash")
+        getattr(st, kind)(msg)
+
+    if ss.user is None:
+        st.header("帳號")
+        tab_in, tab_reg = st.tabs(["登入", "註冊"])
+        with tab_in:
+            with st.form("login_form"):
+                st.text_input("帳號", key="login_user")
+                st.text_input("密碼", type="password", key="login_pw")
+                st.form_submit_button("登入", on_click=cb_login,
+                                      use_container_width=True, type="primary")
+        with tab_reg:
+            with st.form("reg_form"):
+                st.text_input("帳號 (至少 3 字元)", key="reg_user")
+                st.text_input("密碼 (至少 6 字元)", type="password", key="reg_pw")
+                st.text_input("確認密碼", type="password", key="reg_pw2")
+                st.form_submit_button("建立帳號", on_click=cb_register,
+                                      use_container_width=True)
+        st.caption("未登入仍可使用計算器,但無法儲存病患資料。")
+    else:
+        cu, co = st.columns([3, 2])
+        cu.markdown(f"👤 **{ss.user}**")
+        co.button("登出", on_click=cb_logout, use_container_width=True)
+
+        st.header("床位 / 病患")
+        beds = list_beds(ss.user)
+        bed_names = dict(beds)
+        if ss.bed_sel not in bed_names:
+            ss.bed_sel = None
+        st.selectbox("選擇床位", list(bed_names), index=None,
+                     format_func=lambda i: bed_names.get(i, "?"),
+                     placeholder="尚未選擇 (新增或選擇床位)" if beds else "尚無床位,請先新增",
+                     key="bed_sel", on_change=cb_select_bed)
+
+        if ss.bed_sel is not None:
+            st.button("💾 儲存目前資料", on_click=cb_save,
+                      use_container_width=True, type="primary")
+            if ss.saved_snapshot is not None and \
+                    form_snapshot(current_bags()) != ss.saved_snapshot:
+                st.warning("有未儲存的變更")
+            else:
+                st.caption("✅ 已與儲存資料一致")
+
+        with st.expander("➕ 新增床位", expanded=not beds):
+            st.text_input("床位名稱", key="new_bed_name",
+                          placeholder="例如:PICU-3 王小明")
+            st.checkbox("以目前畫面資料建立", key="copy_current",
+                        help="不勾選則以預設值建立空白床位")
+            st.button("新增", on_click=cb_add_bed, use_container_width=True)
+
+        if ss.bed_sel is not None:
+            with st.expander("✏️ 更名 / 🗑️ 移除"):
+                st.text_input("新名稱", key="rename_name")
+                st.button("更名", on_click=cb_rename_bed, use_container_width=True)
+                st.divider()
+                st.checkbox(f"確認移除「{bed_names[ss.bed_sel]}」", key="del_confirm")
+                st.button("移除床位", on_click=cb_delete_bed, use_container_width=True,
+                          disabled=not ss.get("del_confirm"))
+
+    st.divider()
+
 # --- 病人資料 ---
 st.sidebar.header("病人資料")
-col_age, col_sex = st.sidebar.columns([3, 2])
-age_years = col_age.number_input("年齡 (歲)", 0, 18, 10, 1, format="%d",
-                                 help="未滿 1 歲請填 0,再輸入月齡")
-sex = col_sex.radio("性別", ["M", "F"], index=0, horizontal=True)
-age = float(age_years)
-if age_years == 0:
-    # 嬰兒公式依月齡區分 (≤3、≤6、≤12 個月),需另外輸入月齡
-    age_months = st.sidebar.number_input("月齡 (月)", 0, 11, 6, 1, format="%d")
-    age = age_months / 12
-bw = float(st.sidebar.number_input("體重 (kg)", 1, 150, 35, 1, format="%d"))
+age = st.sidebar.number_input("年齡 (歲)", min_value=0.0, max_value=18.0, step=0.1,
+                              key="age", help="嬰兒請用小數,例如 3 個月 = 0.25")
+sex = st.sidebar.radio("性別", ["M", "F"], horizontal=True, key="sex")
+bw = st.sidebar.number_input("體重 (kg)", min_value=1.0, max_value=150.0, step=0.1,
+                             key="bw")
 
-stress_keys = list(STRESS_OPTIONS)
-stress = st.sidebar.selectbox("壓力參數", stress_keys, index=2,
-                              format_func=lambda v: f"{v:g}")
-st.sidebar.caption("\n\n".join(f"**{k:g}**:{v}" for k, v in STRESS_OPTIONS.items()))
-custom = st.sidebar.checkbox("自訂壓力參數")
+stress_label = st.sidebar.selectbox("壓力參數", STRESS_KEYS, key="stress_label")
+stress = STRESS_OPTIONS[stress_label]
+custom = st.sidebar.checkbox("自訂壓力參數", key="custom", on_change=cb_custom_toggle)
 if custom:
-    stress = st.sidebar.number_input("壓力參數", 1.0, 2.5, float(stress), 0.05)
+    stress = st.sidebar.number_input("壓力參數", min_value=1.0, max_value=2.5,
+                                     step=0.05, key="stress_custom")
 cal_factor = st.sidebar.number_input(
-    "熱量係數 (REE x ?)", 0.5, 1.5, 0.85, 0.05,
+    "熱量係數 (REE x ?)", min_value=0.5, max_value=1.5, step=0.05, key="cal_factor",
     help=(
         "PN 熱量需求通常比腸道營養 (EN) 低約 10–15%:\n\n"
         "- PN 直接進入血液,無消化吸收、無糞便流失\n"
@@ -190,127 +554,56 @@ elabel = energy_label(age)
 target_kcal = ree * stress * cal_factor
 maint = maintenance_fluid(bw)
 
-# --- 版面: 左側 PN 配方輸入、右側計算結果,同一畫面顯示 ---
-left, right = st.columns([2, 3], gap="large")
+c1, c2 = st.columns(2)
+c1.metric(f"{elabel} (kcal/d)", f"{ree:,.0f}")
+c2.metric(f"熱量需求 ({elabel} × {stress} × {cal_factor})", f"{target_kcal:,.0f} kcal/d")
+if elabel == "EER":
+    st.info("3 歲以下使用 DRI EER 公式,已包含生長與活動所需能量;"
+            "再乘壓力參數與熱量係數可能重複加成,請依單位慣例確認。")
+
+st.divider()
+
+# --- PN 輸入 ---
+left, right = st.columns([3, 2])
 with left:
     st.subheader("PN 配方")
-    st.caption("輸入各濃度組合的每日容量 (mL),未使用請填 0。濃度可直接修改。")
+    st.caption("輸入各濃度組合的每日容量 (mL),未使用請填 0。可新增 / 修改濃度。")
     bags = st.data_editor(
-        DEFAULT_BAGS,
-        num_rows="fixed",
-        hide_index=True,
+        ss.bags_df,
+        num_rows="dynamic",
         use_container_width=True,
         column_config={
             "Dex (%)": st.column_config.NumberColumn(min_value=0.0, max_value=50.0, step=0.5),
             "AA (%)": st.column_config.NumberColumn(min_value=0.0, max_value=15.0, step=0.5),
-            "Volume (mL)": st.column_config.NumberColumn(min_value=0, step=50, format="%d"),
+            "Volume (mL)": st.column_config.NumberColumn(min_value=0.0, step=50.0),
         },
-        key="bags",
+        key=editor_key(),
     )
 
-    st.markdown("**脂肪 Fat (SMOFlipid 20%)**")
-    fat_vol = st.number_input("容量 (mL/day)", 0, 2000, 400, 50, format="%d",
-                              help="0.2 g/mL、2 kcal/mL(約 10 kcal/g)")
+with right:
+    st.subheader("脂肪 Fat (SMOFlipid 20%)")
+    st.caption("0.2 g/mL、2 kcal/mL(約 10 kcal/g)")
+    fat_vol = st.number_input("容量 (mL/day)", min_value=0.0, max_value=2000.0,
+                              step=50.0, key="fat_vol")
 
 # --- 計算 ---
 r = calc_pn(bags, fat_vol, bw)
-pct = r["kcal"] / target_kcal * 100 if target_kcal else 0
-fluid_pct = r["volume"] / maint * 100 if maint else 0
-
-# --- 超標 / 不足判斷: 直接顯示在各指標下方 (紅字) ---
-infant = age < 1
-max_sir = 14.0
-# 建議下限 = Initial 起始量的下緣
-min_sir, min_aa, min_fat = 3.0, 1.0, 0.5
-max_aa = 4.0 if infant else 2.0
-max_fat = 3.0 if infant else 2.0
-
-
-def check(value: float, low: float, high: float) -> dict:
-    """低於建議起始量或超過上限時,回傳 metric 的紅字 delta;範圍內則不顯示。"""
-    if value > high:
-        return {"delta": f"超過 {value - high:.2f}", "delta_color": "inverse"}
-    if value <= 0:
-        return {"delta": "-未給予", "delta_color": "normal"}
-    if value < low:
-        return {"delta": f"-{low - value:.2f} 低於建議 {low:g}", "delta_color": "normal"}
-    return {}
-
-
-kcal_ratio = r["kcal"] / target_kcal if target_kcal else 0
-if kcal_ratio > KCAL_OVER_LIMIT:
-    kcal_delta = {"delta": f"超過目標 {r['kcal'] - target_kcal:,.0f}", "delta_color": "inverse"}
-elif 0 < kcal_ratio < KCAL_UNDER_LIMIT:
-    kcal_delta = {"delta": f"-{target_kcal - r['kcal']:,.0f} 不足", "delta_color": "normal"}
-else:
-    kcal_delta = {"delta": f"{r['kcal'] - target_kcal:+,.0f} vs 目標", "delta_color": "off"}
-
-fluid_ok = maint > 0 and FLUID_UNDER_LIMIT <= r["volume"] / maint <= FLUID_OVER_LIMIT
-
-sir_delta = check(r["sir"], min_sir, max_sir)
-aa_delta = check(r["aa_kg"], min_aa, max_aa)
-fat_delta = check(r["fat_kg"], min_fat, max_fat)
-all_ok = not (sir_delta or aa_delta or fat_delta
-              or kcal_delta["delta_color"] != "off" or not fluid_ok)
-
-with right:
-    st.subheader("計算結果")
-    m0a, m0b, m1 = st.columns(3)
-    # 水分量: 自訂卡片,介於建議量 90–110% 為綠底,超出或不足為紅底
-    _fg, _bg = ("#177233", "#dff3e4") if fluid_ok else ("#b42318", "#fde4e1")
-    m0a.markdown(
-        f"""
-        <div title="PN + Fat;{r['volume'] / bw:,.0f} mL/kg/day">
-          <div style="font-size:0.875rem; opacity:0.8;">水分量 (mL/d)</div>
-          <div style="font-size:2.25rem; line-height:1.3;">{r['volume']:,.0f}</div>
-          <span style="display:inline-block; padding:2px 10px; border-radius:999px;
-                font-size:0.875rem; color:{_fg}; background:{_bg};">
-            建議量的 {fluid_pct:.0f}%(建議 {maint:,.0f} mL)
-          </span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    m0b.metric("熱量需求 (kcal/d)", f"{target_kcal:,.0f}",
-               help=f"{elabel} × {stress:g} × {cal_factor:g}")
-    m1.metric("PN 熱量 (kcal/d)", f"{r['kcal']:,.0f}", **kcal_delta)
-    m2, m3, m4 = st.columns(3)
-    m2.metric("SIR (mg/kg/min)", f"{r['sir']:.2f}", **sir_delta,
-              help=f"建議 {min_sir:g} – {max_sir:g}")
-    m3.metric("AA (g/kg/day)", f"{r['aa_kg']:.2f}", **aa_delta,
-              help=f"建議 {min_aa:g} – {max_aa:g}")
-    m4.metric("Fat (g/kg/day)", f"{r['fat_kg']:.2f}", **fat_delta,
-              help=f"建議 {min_fat:g} – {max_fat:g}")
-
-    st.progress(min(pct / 100, 1.0), text=f"達成目標熱量 {pct:.0f}%  "
-                                          f"({r['kcal']:,.0f} / {target_kcal:,.0f} kcal)")
-    if all_ok:
-        st.success("熱量、液體量與 SIR / AA / Fat 皆在建議範圍內")
-
-    # 目標範圍對照
-    ref = pd.DataFrame(
-        {
-            "項目": ["SIR (mg/kg/min)", "AA (g/kg/day)", "Fat (g/kg/day)"],
-            "目前": [round(r["sir"], 2), round(r["aa_kg"], 2), round(r["fat_kg"], 2)],
-            "Initial": ["3 - 4", "1 - 2", "0.5 - 1"],
-            "Increment": ["2 - 5", "1", "0.5"],
-            "Maximum": ["12 - 14", "3 - 4 (infant)" if infant else "2 (child)",
-                        "3 (infant)" if infant else "1 - 2 (child)"],
-        }
-    )
-    st.dataframe(ref, hide_index=True, use_container_width=True)
-    st.caption(f"熱量需求 = {elabel} {ree:,.0f} × 壓力參數 {stress:g} × 熱量係數 {cal_factor:g}")
-    st.caption(f"總液體量 (PN + Fat):{r['volume']:,.0f} mL/day "
-               f"({r['volume'] / bw:,.0f} mL/kg/day);"
-               f"Holliday-Segar 維持量 {maint:,.0f} mL/day,占 {fluid_pct:.0f}%")
-    if elabel == "EER":
-        st.info("3 歲以下使用 DRI EER 公式,已包含生長與活動所需能量;"
-                "再乘壓力參數與熱量係數可能重複加成,請依單位慣例確認。")
 
 st.divider()
+st.subheader("計算結果")
 
-# --- 熱量明細 (原本在達成目標熱量下方) ---
-st.subheader("熱量明細")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("PN 熱量 (Kcal/day)", f"{r['kcal']:,.0f}",
+          f"{r['kcal'] - target_kcal:+,.0f} vs 目標")
+m2.metric("SIR (mg/kg/min)", f"{r['sir']:.2f}")
+m3.metric("AA (g/kg/day)", f"{r['aa_kg']:.2f}")
+m4.metric("Fat (g/kg/day)", f"{r['fat_kg']:.2f}")
+
+pct = r["kcal"] / target_kcal * 100 if target_kcal else 0
+st.progress(min(pct / 100, 1.0), text=f"達成目標熱量 {pct:.0f}%  "
+                                      f"({r['kcal']:,.0f} / {target_kcal:,.0f} kcal)")
+
+# 明細
 detail = pd.DataFrame(
     {
         "成分": ["Dextrose", "Amino acid", "Fat (SMOFlipid)", "合計"],
@@ -330,6 +623,49 @@ st.dataframe(
     hide_index=True,
     use_container_width=True,
 )
+fluid_pct = r["volume"] / maint * 100 if maint else 0
+st.caption(f"總液體量 (PN + Fat):{r['volume']:,.0f} mL/day "
+           f"({r['volume'] / bw:,.0f} mL/kg/day);"
+           f"Holliday-Segar 維持量 {maint:,.0f} mL/day,占 {fluid_pct:.0f}%")
+
+# --- 目標對照與提示 ---
+st.subheader("目標範圍對照")
+infant = age < 1
+ref = pd.DataFrame(
+    {
+        "項目": ["SIR (mg/kg/min)", "AA (g/kg/day)", "Fat (g/kg/day)"],
+        "目前": [round(r["sir"], 2), round(r["aa_kg"], 2), round(r["fat_kg"], 2)],
+        "Initial": ["3 - 4", "1 - 2", "0.5 - 1"],
+        "Increment": ["2 - 5", "1", "0.5"],
+        "Maximum": ["12 - 14", "3 - 4 (infant)" if infant else "2 (child)",
+                    "3 (infant)" if infant else "1 - 2 (child)"],
+    }
+)
+st.dataframe(ref, hide_index=True, use_container_width=True)
+
+max_aa = 4.0 if infant else 2.0
+max_fat = 3.0 if infant else 2.0
+warns = []
+if r["sir"] > 14:
+    warns.append(f"SIR {r['sir']:.1f} mg/kg/min 超過上限 12–14")
+if r["aa_kg"] > max_aa:
+    warns.append(f"AA {r['aa_kg']:.2f} g/kg/day 超過上限 {max_aa:g}")
+if r["fat_kg"] > max_fat:
+    warns.append(f"Fat {r['fat_kg']:.2f} g/kg/day 超過上限 {max_fat:g}")
+if target_kcal > 0:
+    ratio = r["kcal"] / target_kcal
+    if ratio > KCAL_OVER_LIMIT:
+        warns.append(f"PN 熱量 {r['kcal']:,.0f} kcal 為目標的 {ratio * 100:.0f}%,超過目標 "
+                     f"{(KCAL_OVER_LIMIT - 1) * 100:.0f}% 以上")
+    elif ratio < KCAL_UNDER_LIMIT and r["kcal"] > 0:
+        warns.append(f"PN 熱量僅達目標的 {ratio * 100:.0f}%")
+if maint > 0 and r["volume"] > maint * FLUID_OVER_LIMIT:
+    warns.append(f"總液體量 {r['volume']:,.0f} mL 為維持量的 {fluid_pct:.0f}%,請留意液體過多")
+if warns:
+    for w in warns:
+        st.warning("⚠️ " + w)
+else:
+    st.success("熱量、液體量與 SIR / AA / Fat 皆在建議範圍內")
 
 st.caption("※ 本工具僅供輔助計算,實際處方請由臨床醫師/營養師確認。")
 st.caption("Neil JJC HMMCH 製作")
