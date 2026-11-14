@@ -6,13 +6,34 @@ TPN / PN 計算器 (Streamlit)
   - PN 熱量 = Dex(g) x 3.4 + AA(g) x 4 + SMOFlipid 20%(mL) x 2
   - SIR (mg/kg/min) = Dex(g) x 1000 / 1440 / BW
   - AA、Fat (g/kg/day)
-執行: streamlit run streamlit_app.py
+新增:
+  - 帳號註冊 / 登入 (帳號、密碼皆需 4 個字以上,密碼以 PBKDF2 雜湊儲存)
+  - 標題旁的按鈕: 登入 / 註冊;登入後同位置可選擇病患、儲存、看歷史紀錄、管理病患
+  - 病患、歷史紀錄都可單獨刪除 (刪除前會再確認)
+  - 計算器不登入也能使用
+  - 需要 Streamlit >= 1.40 (st.dialog、具 key 的 container)
+  - 資料存在同資料夾的 SQLite 檔案 tpn_data.db
+執行: streamlit run TPN.py
 """
 import base64
+import hashlib
+import hmac
+import json
+import secrets
+import sqlite3
+import tempfile
+from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("Asia/Taipei")
+except Exception:  # 系統沒有時區資料時改用本機時間
+    TZ = None
 
 # ----------------------------------------------------------------------
 # 核心計算 (與 Excel 公式一致)
@@ -90,6 +111,7 @@ def calc_pn(df: pd.DataFrame, fat_vol: float, bw: float) -> dict:
     }
 
 
+BAG_COLS = ["Dex (%)", "AA (%)", "Volume (mL)"]
 DEFAULT_BAGS = pd.DataFrame(
     {
         "Dex (%)": [5, 7.5, 10, 12.5, 15, 20],
@@ -97,6 +119,480 @@ DEFAULT_BAGS = pd.DataFrame(
         "Volume (mL)": [0, 0, 0, 0, 0, 0],
     }
 ).astype(float)
+
+# ----------------------------------------------------------------------
+# 資料庫 (SQLite): 帳號、病患、紀錄
+# ----------------------------------------------------------------------
+def _pick_db_path() -> Path:
+    """找一個可以寫入的位置放資料庫。
+    Streamlit Cloud 上程式所在資料夾可能是唯讀的,寫不進去就改放家目錄或暫存資料夾。"""
+    candidates = [Path(__file__).parent, Path.home(), Path(tempfile.gettempdir())]
+    for folder in candidates:
+        path = folder / "tpn_data.db"
+        try:
+            with closing(sqlite3.connect(path)) as c, c:
+                c.execute("CREATE TABLE IF NOT EXISTS _write_test (x INTEGER)")
+                c.execute("INSERT INTO _write_test VALUES (1)")
+                c.execute("DROP TABLE _write_test")
+            return path
+        except (sqlite3.Error, OSError):
+            continue
+    raise RuntimeError("找不到可寫入的位置來存放資料庫")
+
+
+DB_PATH = _pick_db_path()
+MIN_LEN = 4  # 帳號、密碼最少字數
+PBKDF2_ROUNDS = 200_000
+
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db() -> None:
+    with closing(db()) as c, c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                username   TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                pw_hash    TEXT NOT NULL,
+                salt       TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS patients (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name       TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (user_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS records (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id INTEGER NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                note       TEXT,
+                data       TEXT NOT NULL
+            );
+            """
+        )
+
+
+def now_str() -> str:
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hash_pw(password: str, salt_hex: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex),
+                               PBKDF2_ROUNDS).hex()
+
+
+def create_user(username: str, password: str):
+    """成功回傳 (user_id, None);失敗回傳 (None, 錯誤訊息)。"""
+    username = username.strip()
+    if len(username) < MIN_LEN:
+        return None, f"帳號至少需要 {MIN_LEN} 個字"
+    if len(password) < MIN_LEN:
+        return None, f"密碼至少需要 {MIN_LEN} 個字"
+    salt = secrets.token_hex(16)
+    try:
+        with closing(db()) as c, c:
+            cur = c.execute(
+                "INSERT INTO users (username, pw_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+                (username, _hash_pw(password, salt), salt, now_str()),
+            )
+            return cur.lastrowid, None
+    except sqlite3.IntegrityError:
+        return None, "此帳號已被使用"
+
+
+def verify_user(username: str, password: str):
+    """帳密正確回傳 {'id', 'username'},否則 None。"""
+    with closing(db()) as c:
+        row = c.execute("SELECT * FROM users WHERE username = ?", (username.strip(),)).fetchone()
+    if row and hmac.compare_digest(row["pw_hash"], _hash_pw(password, row["salt"])):
+        return {"id": row["id"], "username": row["username"]}
+    return None
+
+
+def list_patients(user_id: int) -> list:
+    with closing(db()) as c:
+        return c.execute(
+            """SELECT p.id, p.name, COUNT(r.id) AS n FROM patients p
+               LEFT JOIN records r ON r.patient_id = p.id
+               WHERE p.user_id = ? GROUP BY p.id ORDER BY p.created_at, p.id""",
+            (user_id,),
+        ).fetchall()
+
+
+def create_patient(user_id: int, name: str):
+    try:
+        with closing(db()) as c, c:
+            cur = c.execute("INSERT INTO patients (user_id, name, created_at) VALUES (?, ?, ?)",
+                            (user_id, name, now_str()))
+            return cur.lastrowid, None
+    except sqlite3.IntegrityError:
+        return None, f"已經有名為「{name}」的病患"
+
+
+def delete_patient(user_id: int, patient_id: int) -> None:
+    # 紀錄會透過 ON DELETE CASCADE 一併刪除
+    with closing(db()) as c, c:
+        c.execute("DELETE FROM patients WHERE id = ? AND user_id = ?", (patient_id, user_id))
+
+
+def add_record(user_id: int, patient_id: int, note: str, data: dict) -> bool:
+    with closing(db()) as c, c:
+        owner = c.execute("SELECT 1 FROM patients WHERE id = ? AND user_id = ?",
+                          (patient_id, user_id)).fetchone()
+        if not owner:
+            return False
+        c.execute("INSERT INTO records (patient_id, created_at, note, data) VALUES (?, ?, ?, ?)",
+                  (patient_id, now_str(), note, json.dumps(data, ensure_ascii=False)))
+        return True
+
+
+def list_records(user_id: int, patient_id: int) -> list:
+    with closing(db()) as c:
+        return c.execute(
+            """SELECT r.id, r.created_at, r.note, r.data FROM records r
+               JOIN patients p ON p.id = r.patient_id
+               WHERE r.patient_id = ? AND p.user_id = ?
+               ORDER BY r.created_at DESC, r.id DESC""",
+            (patient_id, user_id),
+        ).fetchall()
+
+
+def delete_record(user_id: int, record_id: int) -> None:
+    with closing(db()) as c, c:
+        c.execute(
+            """DELETE FROM records WHERE id = ? AND patient_id IN
+               (SELECT id FROM patients WHERE user_id = ?)""",
+            (record_id, user_id),
+        )
+
+
+init_db()
+
+# ----------------------------------------------------------------------
+# 輸入欄位的狀態 (用 session_state 才能從歷史紀錄載入)
+# ----------------------------------------------------------------------
+DEFAULT_INPUTS = {
+    "age_years": 10,
+    "age_months": 6,
+    "sex": "M",
+    "bw": 35,
+    "stress_sel": 1.7,
+    "custom": False,
+    "stress_custom": 1.7,
+    "cal_factor": 0.85,
+    "fat_vol": 400,
+}
+INT_KEYS = {"age_years", "age_months", "bw", "fat_vol"}
+FLOAT_KEYS = {"stress_sel", "stress_custom", "cal_factor"}
+
+ss = st.session_state
+for _k, _v in DEFAULT_INPUTS.items():
+    ss.setdefault(_k, _v)
+ss.setdefault("bags_df", DEFAULT_BAGS.copy())
+ss.setdefault("bags_ver", 0)  # 改變 data_editor 的 key 以套用載入的配方
+ss.setdefault("flash", [])
+ss.pop("_rerun_app", None)
+
+
+def flash(kind: str, msg: str) -> None:
+    """在 callback 裡記下訊息,下次整頁更新時以 toast 顯示。"""
+    ss.flash.append((kind, msg))
+
+
+def apply_inputs(inputs: dict) -> None:
+    """把一組輸入值套用到所有欄位 (只能在 callback 中呼叫)。"""
+    for k, default in DEFAULT_INPUTS.items():
+        v = inputs.get(k, default)
+        if k in INT_KEYS:
+            v = int(v)
+        elif k in FLOAT_KEYS:
+            v = float(v)
+        elif k == "custom":
+            v = bool(v)
+        if k == "stress_sel" and v not in STRESS_OPTIONS:
+            v = DEFAULT_INPUTS["stress_sel"]
+        ss[k] = v
+    bags = inputs.get("bags")
+    ss.bags_df = (pd.DataFrame(bags)[BAG_COLS].astype(float) if bags
+                  else DEFAULT_BAGS.copy())
+    ss.bags_ver += 1
+
+
+def load_latest(pid: int) -> None:
+    """載入病患最近一筆紀錄;沒有紀錄就回到預設值。"""
+    recs = list_records(ss.user["id"], pid)
+    if recs:
+        apply_inputs(json.loads(recs[0]["data"])["inputs"])
+        flash("info", f"已載入最近紀錄 ({recs[0]['created_at'][:16]})")
+    else:
+        apply_inputs(DEFAULT_INPUTS)
+
+
+def request_app_rerun() -> None:
+    """對話框裡的 callback 用:之後整頁重新整理並關閉對話框。"""
+    ss._rerun_app = True
+
+
+def rerun_if_requested() -> None:
+    if ss.pop("_rerun_app", False):
+        st.rerun()
+
+
+# --- callbacks: 帳號 ---
+def cb_login() -> None:
+    user = verify_user(ss.get("li_user", ""), ss.get("li_pw", ""))
+    if not user:
+        ss._auth_err = "帳號或密碼錯誤"
+        return
+    ss.user = user
+    ss.li_pw = ""
+    plist = list_patients(user["id"])
+    if plist:
+        ss.patient_id = plist[0]["id"]
+        load_latest(plist[0]["id"])
+    flash("success", f"歡迎,{user['username']}")
+    request_app_rerun()
+
+
+def cb_register() -> None:
+    u, p, p2 = ss.get("rg_user", ""), ss.get("rg_pw", ""), ss.get("rg_pw2", "")
+    if p != p2:
+        ss._auth_err = "兩次輸入的密碼不一致"
+        return
+    uid, err = create_user(u, p)
+    if err:
+        ss._auth_err = err
+        return
+    ss.user = {"id": uid, "username": u.strip()}
+    ss.rg_pw = ss.rg_pw2 = ""
+    flash("success", "帳號已建立,請新增第一位病患")
+    request_app_rerun()
+
+
+def cb_logout() -> None:
+    for k in ["user", "patient_id", "confirm_del_patient", "confirm_del_record"]:
+        ss.pop(k, None)
+    apply_inputs(DEFAULT_INPUTS)
+    flash("info", "已登出")
+
+
+# --- callbacks: 病患 ---
+def cb_select_patient() -> None:
+    load_latest(ss.patient_id)
+
+
+def cb_add_patient() -> None:
+    name = ss.get("new_patient_name", "").strip()
+    if not name:
+        ss._pat_err = "請輸入病患名稱"
+        return
+    pid, err = create_patient(ss.user["id"], name)
+    if err:
+        ss._pat_err = err
+        return
+    ss.patient_id = pid
+    ss.new_patient_name = ""
+    apply_inputs(DEFAULT_INPUTS)  # 新病患從預設值開始
+    flash("success", f"已新增病患「{name}」")
+    request_app_rerun()
+
+
+def cb_choose_patient(pid: int) -> None:
+    ss.patient_id = pid
+    load_latest(pid)
+    request_app_rerun()
+
+
+def cb_delete_patient(pid: int, name: str) -> None:
+    delete_patient(ss.user["id"], pid)
+    ss.pop("confirm_del_patient", None)
+    if ss.get("patient_id") == pid:
+        ss.pop("patient_id", None)
+    flash("success", f"已刪除病患「{name}」及其紀錄")
+    request_app_rerun()
+
+
+# --- callbacks: 紀錄 ---
+def cb_save_record(pid: int, payload: dict) -> None:
+    note = ss.get("note", "").strip()
+    if add_record(ss.user["id"], pid, note, payload):
+        ss.note = ""
+        flash("success", "已儲存紀錄")
+    else:
+        flash("error", "儲存失敗:找不到此病患")
+    request_app_rerun()
+
+
+def cb_load_record(inputs: dict, created_at: str) -> None:
+    apply_inputs(inputs)
+    flash("info", f"已載入 {created_at} 的紀錄")
+    request_app_rerun()
+
+
+def cb_delete_record(rid: int) -> None:
+    delete_record(ss.user["id"], rid)
+    ss.pop("confirm_del_record", None)  # 對話框保持開啟,可以繼續刪
+
+
+def cb_set(key: str, value) -> None:
+    ss[key] = value
+
+
+# ----------------------------------------------------------------------
+# 對話框
+# ----------------------------------------------------------------------
+@st.dialog("登入 / 註冊")
+def auth_dialog() -> None:
+    rerun_if_requested()
+    err = ss.pop("_auth_err", None)
+    if err:
+        st.error(err)
+    tab_login, tab_reg = st.tabs(["登入", "建立帳號"])
+    with tab_login:
+        with st.form("login_form", border=False):
+            st.text_input("帳號", key="li_user")
+            st.text_input("密碼", type="password", key="li_pw")
+            st.form_submit_button("登入", type="primary", use_container_width=True,
+                                  on_click=cb_login)
+    with tab_reg:
+        with st.form("register_form", border=False):
+            st.text_input("帳號", key="rg_user", help=f"至少 {MIN_LEN} 個字")
+            st.text_input("密碼", type="password", key="rg_pw", help=f"至少 {MIN_LEN} 個字")
+            st.text_input("再次輸入密碼", type="password", key="rg_pw2")
+            st.form_submit_button("建立帳號", type="primary", use_container_width=True,
+                                  on_click=cb_register)
+
+
+@st.dialog("管理病患")
+def patients_dialog() -> None:
+    rerun_if_requested()
+    with st.form("new_patient_form", border=False):
+        c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+        c1.text_input("新增病患", key="new_patient_name", max_chars=50,
+                      placeholder="例: 床號 / 代號")
+        c2.form_submit_button("新增", type="primary", use_container_width=True,
+                              on_click=cb_add_patient)
+    err = ss.pop("_pat_err", None)
+    if err:
+        st.error(err)
+
+    st.divider()
+    plist = list_patients(ss.user["id"])
+    if not plist:
+        st.caption("尚無病患")
+    for p in plist:
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([3, 1.3, 1.3], vertical_alignment="center")
+            current = "　✅ 目前" if p["id"] == ss.get("patient_id") else ""
+            c1.markdown(f"**{p['name']}**{current}  \n{p['n']} 筆紀錄")
+            if ss.get("confirm_del_patient") == p["id"]:
+                c2.button("確認刪除", type="primary", key=f"pdel_ok_{p['id']}",
+                          use_container_width=True,
+                          on_click=cb_delete_patient, args=(p["id"], p["name"]))
+                c3.button("取消", key=f"pdel_no_{p['id']}", use_container_width=True,
+                          on_click=cb_set, args=("confirm_del_patient", None))
+                st.warning(f"將刪除「{p['name']}」及其 {p['n']} 筆紀錄,無法復原。")
+            else:
+                c2.button("選擇", key=f"psel_{p['id']}", use_container_width=True,
+                          on_click=cb_choose_patient, args=(p["id"],))
+                c3.button("🗑 刪除", key=f"pdel_{p['id']}", use_container_width=True,
+                          on_click=cb_set, args=("confirm_del_patient", p["id"]))
+
+
+@st.dialog("儲存紀錄")
+def save_dialog(pid: int, pname: str, payload: dict) -> None:
+    rerun_if_requested()
+    res, inp = payload["results"], payload["inputs"]
+    st.markdown(f"病患:**{pname}**")
+    st.caption(
+        f"體重 {inp['bw']} kg ｜ PN {res['kcal']:,.0f} / 目標 {res['target_kcal']:,.0f} kcal "
+        f"({res['pct']:.0f}%) ｜ SIR {res['sir']:.2f} ｜ AA {res['aa_kg']:.2f} ｜ "
+        f"Fat {res['fat_kg']:.2f} ｜ 水分 {res['volume']:,.0f} mL"
+    )
+    st.text_input("備註 (選填)", key="note", max_chars=200, placeholder="例: Day 3 增量")
+    st.button("💾 儲存", type="primary", use_container_width=True,
+              on_click=cb_save_record, args=(pid, payload))
+
+
+def _age_text(inp: dict) -> str:
+    if int(inp.get("age_years", 0)) == 0:
+        return f"{int(inp.get('age_months', 0))} 個月"
+    return f"{int(inp['age_years'])} 歲"
+
+
+@st.dialog("歷史紀錄", width="large")
+def history_dialog(pid: int, pname: str) -> None:
+    rerun_if_requested()
+    st.markdown(f"病患:**{pname}**")
+    recs = list_records(ss.user["id"], pid)
+    if not recs:
+        st.caption("尚無紀錄。調整好配方後,按上方「💾 儲存」即可存檔。")
+        return
+
+    rows = []
+    for rec in recs:
+        d = json.loads(rec["data"])
+        inp, res = d["inputs"], d["results"]
+        rows.append({
+            "時間": rec["created_at"][:16],
+            "備註": rec["note"] or "",
+            "年齡": _age_text(inp),
+            "體重": inp["bw"],
+            "PN kcal": round(res["kcal"]),
+            "目標": round(res["target_kcal"]),
+            "達成%": round(res["pct"]),
+            "SIR": round(res["sir"], 2),
+            "AA": round(res["aa_kg"], 2),
+            "Fat": round(res["fat_kg"], 2),
+            "水分": round(res["volume"]),
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    for rec in recs:
+        d = json.loads(rec["data"])
+        inp, res = d["inputs"], d["results"]
+        when = rec["created_at"][:16]
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([4, 1, 1], vertical_alignment="center")
+            note = f"　｜{rec['note']}" if rec["note"] else ""
+            c1.markdown(f"**{when}**{note}  \n"
+                        f"PN {res['kcal']:,.0f} / 目標 {res['target_kcal']:,.0f} kcal")
+            if ss.get("confirm_del_record") == rec["id"]:
+                c2.button("確認刪除", type="primary", key=f"rdel_ok_{rec['id']}",
+                          use_container_width=True,
+                          on_click=cb_delete_record, args=(rec["id"],))
+                c3.button("取消", key=f"rdel_no_{rec['id']}", use_container_width=True,
+                          on_click=cb_set, args=("confirm_del_record", None))
+            else:
+                c2.button("載入", key=f"rload_{rec['id']}", use_container_width=True,
+                          on_click=cb_load_record, args=(inp, when))
+                c3.button("🗑 刪除", key=f"rdel_{rec['id']}", use_container_width=True,
+                          on_click=cb_set, args=("confirm_del_record", rec["id"]))
+            with st.expander("詳細內容"):
+                stress_txt = (f"{float(inp['stress_custom']):g} (自訂)" if inp.get("custom")
+                              else f"{float(inp['stress_sel']):g}")
+                st.markdown(
+                    f"**年齡** {_age_text(inp)}　**性別** {inp['sex']}　"
+                    f"**體重** {inp['bw']} kg　**壓力參數** {stress_txt}　"
+                    f"**熱量係數** {float(inp['cal_factor']):g}　"
+                    f"**SMOFlipid** {inp['fat_vol']} mL"
+                )
+                used = pd.DataFrame(inp["bags"])[BAG_COLS]
+                used = used[used["Volume (mL)"] > 0]
+                if len(used):
+                    st.dataframe(used, hide_index=True, use_container_width=True)
+                else:
+                    st.caption("(未使用 PN 袋)")
+
 
 # ----------------------------------------------------------------------
 # UI
@@ -127,17 +623,16 @@ if LOGO_PATH.exists():
     logo_b64 = base64.b64encode(LOGO_PATH.read_bytes()).decode()
     logo_html = (f"<img src='data:image/png;base64,{logo_b64}' "
                  "style='height:64px; vertical-align:middle; margin-right:12px;'>")
-# 標題列固定在畫面上方: 主畫面往下捲動時 logo 與標題不動
 try:
     _dark = st.context.theme.type == "dark"  # Streamlit >= 1.46
 except Exception:
     _dark = False
 _header_bg = "#0e1117" if _dark else "#ffffff"
+# 標題列 (含登入 / 病患按鈕) 固定在畫面上方: 主畫面往下捲動時不動
 st.markdown(
     f"""
     <style>
-    [data-testid="stElementContainer"]:has(.app-title),
-    .element-container:has(.app-title) {{
+    .st-key-app_header {{
         position: sticky;
         top: 0;
         z-index: 999;
@@ -146,33 +641,92 @@ st.markdown(
         border-bottom: 1px solid rgba(128, 128, 128, 0.25);
     }}
     </style>
-    <h1 class='app-title' style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>{logo_html}靜脈營養計算器</h1>
     """,
     unsafe_allow_html=True,
 )
 
-# --- 病人資料 ---
-st.sidebar.header("病人資料")
-col_age, col_sex = st.sidebar.columns([3, 2])
-age_years = col_age.number_input("年齡 (歲)", 0, 18, 10, 1, format="%d",
-                                 help="未滿 1 歲請填 0,再輸入月齡")
-sex = col_sex.radio("性別", ["M", "F"], index=0, horizontal=True)
+# 顯示 callback 留下的訊息
+_ICONS = {"success": "✅", "error": "⚠️", "info": "ℹ️"}
+for _kind, _msg in ss.flash:
+    st.toast(_msg, icon=_ICONS.get(_kind))
+ss.flash = []
+
+# --- 登入狀態與病患清單 ---
+user = ss.get("user")
+patients = {}
+if user:
+    patients = {p["id"]: p["name"] for p in list_patients(user["id"])}
+    if ss.get("patient_id") not in patients:
+        if patients:
+            ss.patient_id = next(iter(patients))
+        else:
+            ss.pop("patient_id", None)
+pid = ss.get("patient_id") if user else None
+dialog_to_open = None
+
+# --- 標題列: 左邊標題,右邊登入 / 病患功能 ---
+with st.container(key="app_header"):
+    h_title, h_ctrl = st.columns([5, 6], vertical_alignment="center")
+    h_title.markdown(
+        "<h1 class='app-title' style='margin-bottom:0; display:flex; align-items:center; "
+        f"flex-wrap:wrap;'>{logo_html}靜脈營養計算器</h1>",
+        unsafe_allow_html=True,
+    )
+    with h_ctrl:
+        if not user:
+            _, c_login = st.columns([3, 1.5])
+            if c_login.button("🔑 登入 / 註冊", use_container_width=True,
+                              help="登入後可建立病患、儲存與查看歷史紀錄"):
+                dialog_to_open = "auth"
+        else:
+            c_pat, c_save, c_hist, c_mgr, c_user = st.columns(
+                [2.6, 1, 1, 1, 0.8], vertical_alignment="center")
+            if patients:
+                c_pat.selectbox("目前病患", list(patients), format_func=lambda i: patients[i],
+                                key="patient_id", on_change=cb_select_patient,
+                                label_visibility="collapsed")
+            else:
+                c_pat.caption("尚無病患,請按「👥 病患」新增")
+            if c_save.button("💾 儲存", disabled=not pid, use_container_width=True,
+                             help="把目前輸入的資料存到這位病患"):
+                dialog_to_open = "save"
+            if c_hist.button("🕘 紀錄", disabled=not pid, use_container_width=True,
+                             help="查看、載入或刪除歷史紀錄"):
+                dialog_to_open = "history"
+            if c_mgr.button("👥 病患", use_container_width=True,
+                            help="新增、選擇或刪除病患"):
+                dialog_to_open = "patients"
+            with c_user.popover("👤", use_container_width=True):
+                st.markdown(f"**{user['username']}**")
+                st.button("登出", on_click=cb_logout, use_container_width=True)
+
+# ----------------------------------------------------------------------
+# 側邊欄: 病人資料
+# ----------------------------------------------------------------------
+sb = st.sidebar
+sb.header("病人資料")
+col_age, col_sex = sb.columns([3, 2])
+age_years = col_age.number_input("年齡 (歲)", min_value=0, max_value=18, step=1, format="%d",
+                                 key="age_years", help="未滿 1 歲請填 0,再輸入月齡")
+sex = col_sex.radio("性別", ["M", "F"], horizontal=True, key="sex")
 age = float(age_years)
 if age_years == 0:
     # 嬰兒公式依月齡區分 (≤3、≤6、≤12 個月),需另外輸入月齡
-    age_months = st.sidebar.number_input("月齡 (月)", 0, 11, 6, 1, format="%d")
+    age_months = sb.number_input("月齡 (月)", min_value=0, max_value=11, step=1, format="%d",
+                                 key="age_months")
     age = age_months / 12
-bw = float(st.sidebar.number_input("體重 (kg)", 1, 150, 35, 1, format="%d"))
+bw = float(sb.number_input("體重 (kg)", min_value=1, max_value=150, step=1, format="%d",
+                           key="bw"))
 
-stress_keys = list(STRESS_OPTIONS)
-stress = st.sidebar.selectbox("壓力參數", stress_keys, index=2,
-                              format_func=lambda v: f"{v:g}")
-st.sidebar.caption("\n\n".join(f"**{k:g}**:{v}" for k, v in STRESS_OPTIONS.items()))
-custom = st.sidebar.checkbox("自訂壓力參數")
+stress = sb.selectbox("壓力參數", list(STRESS_OPTIONS), key="stress_sel",
+                      format_func=lambda v: f"{v:g}")
+sb.caption("\n\n".join(f"**{k:g}**:{v}" for k, v in STRESS_OPTIONS.items()))
+custom = sb.checkbox("自訂壓力參數", key="custom")
 if custom:
-    stress = st.sidebar.number_input("壓力參數", 1.0, 2.5, float(stress), 0.05)
-cal_factor = st.sidebar.number_input(
-    "熱量係數 (REE x ?)", 0.5, 1.5, 0.85, 0.05,
+    stress = sb.number_input("壓力參數 (自訂)", min_value=1.0, max_value=2.5, step=0.05,
+                             key="stress_custom")
+cal_factor = sb.number_input(
+    "熱量係數 (REE x ?)", min_value=0.5, max_value=1.5, step=0.05, key="cal_factor",
     help=(
         "PN 熱量需求通常比腸道營養 (EN) 低約 10–15%:\n\n"
         "- PN 直接進入血液,無消化吸收、無糞便流失\n"
@@ -182,7 +736,7 @@ cal_factor = st.sidebar.number_input(
         "若同時有部分腸道營養或單位慣例不打折,可改為 0.9–1.0。"
     ),
 )
-st.sidebar.caption("熱量係數:PN 約為 EN 需求的 85–90%,預設 0.85")
+sb.caption("熱量係數:PN 約為 EN 需求的 85–90%,預設 0.85")
 
 # --- 目標熱量 ---
 ree = calc_ree(age, sex, bw)
@@ -196,7 +750,7 @@ with left:
     st.subheader("PN 配方")
     st.caption("輸入各濃度組合的每日容量 (mL),未使用請填 0。濃度可直接修改。")
     bags = st.data_editor(
-        DEFAULT_BAGS,
+        ss.bags_df,
         num_rows="fixed",
         hide_index=True,
         use_container_width=True,
@@ -205,11 +759,12 @@ with left:
             "AA (%)": st.column_config.NumberColumn(min_value=0.0, max_value=15.0, step=0.5),
             "Volume (mL)": st.column_config.NumberColumn(min_value=0, step=50, format="%d"),
         },
-        key="bags",
+        key=f"bags_{ss.bags_ver}",
     )
 
     st.markdown("**脂肪 Fat (SMOFlipid 20%)**")
-    fat_vol = st.number_input("容量 (mL/day)", 0, 2000, 400, 50, format="%d",
+    fat_vol = st.number_input("容量 (mL/day)", min_value=0, max_value=2000, step=50,
+                              format="%d", key="fat_vol",
                               help="0.2 g/mL、2 kcal/mL(約 10 kcal/g)")
 
 # --- 計算 ---
@@ -334,3 +889,32 @@ st.dataframe(
 st.caption("※ 本工具僅供輔助計算,實際處方請由臨床醫師/營養師確認。")
 st.caption("Neil JJC HMMCH 製作")
 
+# ----------------------------------------------------------------------
+# 開啟標題列按下的對話框 (放最後,儲存時才拿得到計算結果)
+# ----------------------------------------------------------------------
+if dialog_to_open == "auth":
+    auth_dialog()
+elif dialog_to_open == "patients":
+    patients_dialog()
+elif dialog_to_open == "history" and pid:
+    history_dialog(pid, patients[pid])
+elif dialog_to_open == "save" and pid:
+    save_dialog(pid, patients[pid], {
+        "inputs": {
+            **{k: ss[k] for k in DEFAULT_INPUTS},
+            "bags": {c: [float(x) for x in bags[c].fillna(0)] for c in BAG_COLS},
+        },
+        "results": {
+            "elabel": elabel,
+            "ree": float(ree),
+            "stress": float(stress),
+            "target_kcal": float(target_kcal),
+            "kcal": float(r["kcal"]),
+            "pct": float(pct),
+            "sir": float(r["sir"]),
+            "aa_kg": float(r["aa_kg"]),
+            "fat_kg": float(r["fat_kg"]),
+            "volume": float(r["volume"]),
+            "fluid_pct": float(fluid_pct),
+        },
+    })
