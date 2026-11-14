@@ -653,13 +653,12 @@ def history_dialog(pid: int, pname: str) -> None:
         df,
         key=editor_key,
         hide_index=True,
-        use_container_width=True,
         num_rows="fixed",
         disabled=[c for c in df.columns if c not in ("載入", "刪除")],
+        # 不指定欄寬、不撐滿畫面:每欄自動配合欄名或內容的寬度
         column_config={
-            "載入": st.column_config.CheckboxColumn("載入", width="small"),
-            "刪除": st.column_config.CheckboxColumn("刪除", width="small"),
-            "PN 配方 (濃度 / 容量)": st.column_config.TextColumn(width="large"),
+            "載入": st.column_config.CheckboxColumn("載入"),
+            "刪除": st.column_config.CheckboxColumn("刪除"),
         },
         on_change=cb_history_table,
         args=(editor_key, rec_ids, inputs_list, whens),
