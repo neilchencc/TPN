@@ -26,12 +26,14 @@ FAT_KCAL_PER_ML = 2.0
 # 警示門檻
 KCAL_OVER_LIMIT = 1.10   # PN 熱量超過目標 110% 提醒
 KCAL_UNDER_LIMIT = 0.90  # 低於目標 90% 提醒
-FLUID_OVER_LIMIT = 1.10  # 總液體量超過維持量 110% 提醒
+FLUID_OVER_LIMIT = 1.10   # 總液體量超過維持量 110% 提醒 (紅底)
+FLUID_UNDER_LIMIT = 0.90  # 低於維持量 90% 提醒 (紅底);介於兩者之間為綠底
 
+# 壓力參數: 選單只顯示數值,說明另外列在選單下方
 STRESS_OPTIONS = {
-    "1.3 — 營養良好、臥床、輕~中度壓力": 1.3,
-    "1.5 — 正常活動且輕~中度壓力 / 臥床但重度壓力 / 低活動且營養不良需追趕": 1.5,
-    "1.7 — 活動量大需追趕生長 / 活動量大且重度壓力": 1.7,
+    1.3: "營養良好、臥床、輕~中度壓力",
+    1.5: "正常活動且輕~中度壓力 / 臥床但重度壓力 / 低活動且營養不良需追趕",
+    1.7: "活動量大需追趕生長 / 活動量大且重度壓力",
 }
 
 
@@ -125,22 +127,47 @@ if LOGO_PATH.exists():
     logo_b64 = base64.b64encode(LOGO_PATH.read_bytes()).decode()
     logo_html = (f"<img src='data:image/png;base64,{logo_b64}' "
                  "style='height:64px; vertical-align:middle; margin-right:12px;'>")
+# 標題列固定在畫面上方: 主畫面往下捲動時 logo 與標題不動
+try:
+    _dark = st.context.theme.type == "dark"  # Streamlit >= 1.46
+except Exception:
+    _dark = False
+_header_bg = "#0e1117" if _dark else "#ffffff"
 st.markdown(
-    f"<h1 style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>"
-    f"{logo_html}靜脈營養計算器</h1>",
+    f"""
+    <style>
+    [data-testid="stElementContainer"]:has(.app-title),
+    .element-container:has(.app-title) {{
+        position: sticky;
+        top: 0;
+        z-index: 999;
+        background-color: {_header_bg};
+        padding-bottom: 0.25rem;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+    }}
+    </style>
+    <h1 class='app-title' style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>{logo_html}靜脈營養計算器</h1>
+    """,
     unsafe_allow_html=True,
 )
 
 # --- 病人資料 ---
 st.sidebar.header("病人資料")
-age = st.sidebar.number_input("年齡 (歲)", 0.0, 18.0, 10.0, 0.1,
-                              help="嬰兒請用小數,例如 3 個月 = 0.25")
-sex = st.sidebar.radio("性別", ["M", "F"], index=0, horizontal=True)
-bw = st.sidebar.number_input("體重 (kg)", 1.0, 150.0, 34.5, 0.1)
+col_age, col_sex = st.sidebar.columns([3, 2])
+age_years = col_age.number_input("年齡 (歲)", 0, 18, 10, 1, format="%d",
+                                 help="未滿 1 歲請填 0,再輸入月齡")
+sex = col_sex.radio("性別", ["M", "F"], index=0, horizontal=True)
+age = float(age_years)
+if age_years == 0:
+    # 嬰兒公式依月齡區分 (≤3、≤6、≤12 個月),需另外輸入月齡
+    age_months = st.sidebar.number_input("月齡 (月)", 0, 11, 6, 1, format="%d")
+    age = age_months / 12
+bw = float(st.sidebar.number_input("體重 (kg)", 1, 150, 35, 1, format="%d"))
 
 stress_keys = list(STRESS_OPTIONS)
-stress_label = st.sidebar.selectbox("壓力參數", stress_keys, index=2)
-stress = STRESS_OPTIONS[stress_label]
+stress = st.sidebar.selectbox("壓力參數", stress_keys, index=2,
+                              format_func=lambda v: f"{v:g}")
+st.sidebar.caption("\n\n".join(f"**{k:g}**:{v}" for k, v in STRESS_OPTIONS.items()))
 custom = st.sidebar.checkbox("自訂壓力參數")
 if custom:
     stress = st.sidebar.number_input("壓力參數", 1.0, 2.5, float(stress), 0.05)
@@ -163,55 +190,127 @@ elabel = energy_label(age)
 target_kcal = ree * stress * cal_factor
 maint = maintenance_fluid(bw)
 
-c1, c2 = st.columns(2)
-c1.metric(f"{elabel} (kcal/d)", f"{ree:,.0f}")
-c2.metric(f"熱量需求 ({elabel} × {stress} × {cal_factor})", f"{target_kcal:,.0f} kcal/d")
-if elabel == "EER":
-    st.info("3 歲以下使用 DRI EER 公式,已包含生長與活動所需能量;"
-            "再乘壓力參數與熱量係數可能重複加成,請依單位慣例確認。")
-
-st.divider()
-
-# --- PN 輸入 ---
-left, right = st.columns([3, 2])
+# --- 版面: 左側 PN 配方輸入、右側計算結果,同一畫面顯示 ---
+left, right = st.columns([2, 3], gap="large")
 with left:
     st.subheader("PN 配方")
-    st.caption("輸入各濃度組合的每日容量 (mL),未使用請填 0。可新增 / 修改濃度。")
+    st.caption("輸入各濃度組合的每日容量 (mL),未使用請填 0。濃度可直接修改。")
     bags = st.data_editor(
         DEFAULT_BAGS,
-        num_rows="dynamic",
+        num_rows="fixed",
+        hide_index=True,
         use_container_width=True,
         column_config={
             "Dex (%)": st.column_config.NumberColumn(min_value=0.0, max_value=50.0, step=0.5),
             "AA (%)": st.column_config.NumberColumn(min_value=0.0, max_value=15.0, step=0.5),
-            "Volume (mL)": st.column_config.NumberColumn(min_value=0.0, step=50.0),
+            "Volume (mL)": st.column_config.NumberColumn(min_value=0, step=50, format="%d"),
         },
         key="bags",
     )
 
-with right:
-    st.subheader("脂肪 Fat (SMOFlipid 20%)")
-    st.caption("0.2 g/mL、2 kcal/mL(約 10 kcal/g)")
-    fat_vol = st.number_input("容量 (mL/day)", 0.0, 2000.0, 400.0, 50.0)
+    st.markdown("**脂肪 Fat (SMOFlipid 20%)**")
+    fat_vol = st.number_input("容量 (mL/day)", 0, 2000, 400, 50, format="%d",
+                              help="0.2 g/mL、2 kcal/mL(約 10 kcal/g)")
 
 # --- 計算 ---
 r = calc_pn(bags, fat_vol, bw)
+pct = r["kcal"] / target_kcal * 100 if target_kcal else 0
+fluid_pct = r["volume"] / maint * 100 if maint else 0
+
+# --- 超標 / 不足判斷: 直接顯示在各指標下方 (紅字) ---
+infant = age < 1
+max_sir = 14.0
+# 建議下限 = Initial 起始量的下緣
+min_sir, min_aa, min_fat = 3.0, 1.0, 0.5
+max_aa = 4.0 if infant else 2.0
+max_fat = 3.0 if infant else 2.0
+
+
+def check(value: float, low: float, high: float) -> dict:
+    """低於建議起始量或超過上限時,回傳 metric 的紅字 delta;範圍內則不顯示。"""
+    if value > high:
+        return {"delta": f"超過 {value - high:.2f}", "delta_color": "inverse"}
+    if value <= 0:
+        return {"delta": "-未給予", "delta_color": "normal"}
+    if value < low:
+        return {"delta": f"-{low - value:.2f} 低於建議 {low:g}", "delta_color": "normal"}
+    return {}
+
+
+kcal_ratio = r["kcal"] / target_kcal if target_kcal else 0
+if kcal_ratio > KCAL_OVER_LIMIT:
+    kcal_delta = {"delta": f"超過目標 {r['kcal'] - target_kcal:,.0f}", "delta_color": "inverse"}
+elif 0 < kcal_ratio < KCAL_UNDER_LIMIT:
+    kcal_delta = {"delta": f"-{target_kcal - r['kcal']:,.0f} 不足", "delta_color": "normal"}
+else:
+    kcal_delta = {"delta": f"{r['kcal'] - target_kcal:+,.0f} vs 目標", "delta_color": "off"}
+
+fluid_ok = maint > 0 and FLUID_UNDER_LIMIT <= r["volume"] / maint <= FLUID_OVER_LIMIT
+
+sir_delta = check(r["sir"], min_sir, max_sir)
+aa_delta = check(r["aa_kg"], min_aa, max_aa)
+fat_delta = check(r["fat_kg"], min_fat, max_fat)
+all_ok = not (sir_delta or aa_delta or fat_delta
+              or kcal_delta["delta_color"] != "off" or not fluid_ok)
+
+with right:
+    st.subheader("計算結果")
+    m0a, m0b, m1 = st.columns(3)
+    # 水分量: 自訂卡片,介於建議量 90–110% 為綠底,超出或不足為紅底
+    _fg, _bg = ("#177233", "#dff3e4") if fluid_ok else ("#b42318", "#fde4e1")
+    m0a.markdown(
+        f"""
+        <div title="PN + Fat;{r['volume'] / bw:,.0f} mL/kg/day">
+          <div style="font-size:0.875rem; opacity:0.8;">水分量 (mL/d)</div>
+          <div style="font-size:2.25rem; line-height:1.3;">{r['volume']:,.0f}</div>
+          <span style="display:inline-block; padding:2px 10px; border-radius:999px;
+                font-size:0.875rem; color:{_fg}; background:{_bg};">
+            建議量的 {fluid_pct:.0f}%(建議 {maint:,.0f} mL)
+          </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    m0b.metric("熱量需求 (kcal/d)", f"{target_kcal:,.0f}",
+               help=f"{elabel} × {stress:g} × {cal_factor:g}")
+    m1.metric("PN 熱量 (kcal/d)", f"{r['kcal']:,.0f}", **kcal_delta)
+    m2, m3, m4 = st.columns(3)
+    m2.metric("SIR (mg/kg/min)", f"{r['sir']:.2f}", **sir_delta,
+              help=f"建議 {min_sir:g} – {max_sir:g}")
+    m3.metric("AA (g/kg/day)", f"{r['aa_kg']:.2f}", **aa_delta,
+              help=f"建議 {min_aa:g} – {max_aa:g}")
+    m4.metric("Fat (g/kg/day)", f"{r['fat_kg']:.2f}", **fat_delta,
+              help=f"建議 {min_fat:g} – {max_fat:g}")
+
+    st.progress(min(pct / 100, 1.0), text=f"達成目標熱量 {pct:.0f}%  "
+                                          f"({r['kcal']:,.0f} / {target_kcal:,.0f} kcal)")
+    if all_ok:
+        st.success("熱量、液體量與 SIR / AA / Fat 皆在建議範圍內")
+
+    # 目標範圍對照
+    ref = pd.DataFrame(
+        {
+            "項目": ["SIR (mg/kg/min)", "AA (g/kg/day)", "Fat (g/kg/day)"],
+            "目前": [round(r["sir"], 2), round(r["aa_kg"], 2), round(r["fat_kg"], 2)],
+            "Initial": ["3 - 4", "1 - 2", "0.5 - 1"],
+            "Increment": ["2 - 5", "1", "0.5"],
+            "Maximum": ["12 - 14", "3 - 4 (infant)" if infant else "2 (child)",
+                        "3 (infant)" if infant else "1 - 2 (child)"],
+        }
+    )
+    st.dataframe(ref, hide_index=True, use_container_width=True)
+    st.caption(f"熱量需求 = {elabel} {ree:,.0f} × 壓力參數 {stress:g} × 熱量係數 {cal_factor:g}")
+    st.caption(f"總液體量 (PN + Fat):{r['volume']:,.0f} mL/day "
+               f"({r['volume'] / bw:,.0f} mL/kg/day);"
+               f"Holliday-Segar 維持量 {maint:,.0f} mL/day,占 {fluid_pct:.0f}%")
+    if elabel == "EER":
+        st.info("3 歲以下使用 DRI EER 公式,已包含生長與活動所需能量;"
+                "再乘壓力參數與熱量係數可能重複加成,請依單位慣例確認。")
 
 st.divider()
-st.subheader("計算結果")
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("PN 熱量 (Kcal/day)", f"{r['kcal']:,.0f}",
-          f"{r['kcal'] - target_kcal:+,.0f} vs 目標")
-m2.metric("SIR (mg/kg/min)", f"{r['sir']:.2f}")
-m3.metric("AA (g/kg/day)", f"{r['aa_kg']:.2f}")
-m4.metric("Fat (g/kg/day)", f"{r['fat_kg']:.2f}")
-
-pct = r["kcal"] / target_kcal * 100 if target_kcal else 0
-st.progress(min(pct / 100, 1.0), text=f"達成目標熱量 {pct:.0f}%  "
-                                      f"({r['kcal']:,.0f} / {target_kcal:,.0f} kcal)")
-
-# 明細
+# --- 熱量明細 (原本在達成目標熱量下方) ---
+st.subheader("熱量明細")
 detail = pd.DataFrame(
     {
         "成分": ["Dextrose", "Amino acid", "Fat (SMOFlipid)", "合計"],
@@ -231,49 +330,6 @@ st.dataframe(
     hide_index=True,
     use_container_width=True,
 )
-fluid_pct = r["volume"] / maint * 100 if maint else 0
-st.caption(f"總液體量 (PN + Fat):{r['volume']:,.0f} mL/day "
-           f"({r['volume'] / bw:,.0f} mL/kg/day);"
-           f"Holliday-Segar 維持量 {maint:,.0f} mL/day,占 {fluid_pct:.0f}%")
-
-# --- 目標對照與提示 ---
-st.subheader("目標範圍對照")
-infant = age < 1
-ref = pd.DataFrame(
-    {
-        "項目": ["SIR (mg/kg/min)", "AA (g/kg/day)", "Fat (g/kg/day)"],
-        "目前": [round(r["sir"], 2), round(r["aa_kg"], 2), round(r["fat_kg"], 2)],
-        "Initial": ["3 - 4", "1 - 2", "0.5 - 1"],
-        "Increment": ["2 - 5", "1", "0.5"],
-        "Maximum": ["12 - 14", "3 - 4 (infant)" if infant else "2 (child)",
-                    "3 (infant)" if infant else "1 - 2 (child)"],
-    }
-)
-st.dataframe(ref, hide_index=True, use_container_width=True)
-
-max_aa = 4.0 if infant else 2.0
-max_fat = 3.0 if infant else 2.0
-warns = []
-if r["sir"] > 14:
-    warns.append(f"SIR {r['sir']:.1f} mg/kg/min 超過上限 12–14")
-if r["aa_kg"] > max_aa:
-    warns.append(f"AA {r['aa_kg']:.2f} g/kg/day 超過上限 {max_aa:g}")
-if r["fat_kg"] > max_fat:
-    warns.append(f"Fat {r['fat_kg']:.2f} g/kg/day 超過上限 {max_fat:g}")
-if target_kcal > 0:
-    ratio = r["kcal"] / target_kcal
-    if ratio > KCAL_OVER_LIMIT:
-        warns.append(f"PN 熱量 {r['kcal']:,.0f} kcal 為目標的 {ratio * 100:.0f}%,超過目標 "
-                     f"{(KCAL_OVER_LIMIT - 1) * 100:.0f}% 以上")
-    elif ratio < KCAL_UNDER_LIMIT and r["kcal"] > 0:
-        warns.append(f"PN 熱量僅達目標的 {ratio * 100:.0f}%")
-if maint > 0 and r["volume"] > maint * FLUID_OVER_LIMIT:
-    warns.append(f"總液體量 {r['volume']:,.0f} mL 為維持量的 {fluid_pct:.0f}%,請留意液體過多")
-if warns:
-    for w in warns:
-        st.warning("⚠️ " + w)
-else:
-    st.success("熱量、液體量與 SIR / AA / Fat 皆在建議範圍內")
 
 st.caption("※ 本工具僅供輔助計算,實際處方請由臨床醫師/營養師確認。")
 st.caption("Neil JJC HMMCH 製作")
