@@ -598,9 +598,12 @@ def _text_width(text) -> int:
 
 
 def _cell(text, header: bool = False) -> str:
+    # 用固定最小高度 + flex 置中,讓文字和按鈕在同一水平線上
     weight = "font-weight:600;" if header else ""
-    return (f"<div style='text-align:center; {weight} font-size:0.9rem; "
-            f"line-height:1.4; word-break:break-word;'>{text}</div>")
+    height = "2rem" if header else "2.5rem"
+    return (f"<div style='display:flex; align-items:center; justify-content:center; "
+            f"min-height:{height}; text-align:center; {weight} font-size:0.9rem; "
+            f"line-height:1.3; word-break:break-word;'>{text}</div>")
 
 
 @st.dialog("歷史紀錄", width="large")
@@ -638,7 +641,7 @@ def history_dialog(pid: int, pname: str) -> None:
     cols = [c for c in rows[0] if not c.startswith("_")]
 
     # 欄寬 = 欄名與內容中最寬的那個 (按鈕欄給固定寬度)
-    widths = [6, 6] + [
+    widths = [5, 5] + [
         max(_text_width(c), *(_text_width(r[c]) for r in rows)) + 2 for c in cols
     ]
 
@@ -647,10 +650,18 @@ def history_dialog(pid: int, pname: str) -> None:
         """
         <style>
         [class*="st-key-hrow_"] {
-            border-bottom: 1px solid rgba(128, 128, 128, 0.2);
-            padding: 0.15rem 0;
+            border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+            padding: 0.3rem 0;
         }
-        [class*="st-key-hrow_"] p { margin: 0; }
+        .st-key-hrow_header { border-bottom-width: 2px; }
+        /* Streamlit 文字元件預設有負的下邊距,會讓分隔線壓到文字、文字偏下,這裡歸零 */
+        [class*="st-key-hrow_"] [data-testid="stMarkdown"],
+        [class*="st-key-hrow_"] [data-testid="stMarkdownContainer"],
+        [class*="st-key-hrow_"] .stMarkdown {
+            margin: 0 !important;
+        }
+        [class*="st-key-hrow_"] p { margin: 0 !important; }
+        [class*="st-key-hrow_"] button { min-height: 2.5rem; padding: 0 0.25rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -665,7 +676,8 @@ def history_dialog(pid: int, pname: str) -> None:
         rid = r["_id"]
         with st.container(key=f"hrow_{rid}"):
             cells = st.columns(widths, gap="small", vertical_alignment="center")
-            cells[0].button("載入", key=f"rload_{rid}", use_container_width=True,
+            cells[0].button("📥", key=f"rload_{rid}", use_container_width=True,
+                            help="載入這筆資料到計算器",
                             on_click=cb_load_record, args=(r["_inp"], r["時間"]))
             cells[1].button("🗑", key=f"rdel_{rid}", use_container_width=True,
                             help="刪除這筆紀錄",
@@ -728,6 +740,12 @@ _header_bg = "#0e1117" if _dark else "#ffffff"
 st.markdown(
     f"""
     <style>
+    /* 病患選單欄寬: 約 5 個英數 + 4 個中文字 */
+    [data-testid="stColumn"]:has(.st-key-pat_sel) {{
+        flex: 0 0 10rem !important;
+        width: 10rem !important;
+        min-width: 10rem !important;
+    }}
     .st-key-app_header {{
         position: sticky;
         top: 0;
@@ -779,26 +797,28 @@ with st.container(key="app_header"):
                               help="登入後可建立病患、儲存與查看歷史紀錄"):
                 dialog_to_open = "auth"
         else:
-            c_pat, c_save, c_hist, c_mgr, c_user = st.columns(
-                [2.6, 1, 1, 1, 0.8], vertical_alignment="center")
-            if patients:
-                c_pat.selectbox("目前病患", list(patients), format_func=lambda i: patients[i],
-                                key="patient_id", on_change=cb_select_patient,
-                                label_visibility="collapsed")
-            else:
-                c_pat.caption("尚無病患,請按「👥 病患」新增")
+            c_pat, c_save, c_hist, c_acct = st.columns(
+                [1, 1, 1, 1], vertical_alignment="center")
+            with c_pat.container(key="pat_sel"):  # 寬度由 CSS 固定 (約 5 英數 + 4 中文)
+                if patients:
+                    st.selectbox("目前病患", list(patients),
+                                 format_func=lambda i: patients[i],
+                                 key="patient_id", on_change=cb_select_patient,
+                                 label_visibility="collapsed")
+                else:
+                    st.caption("尚無病患")
             if c_save.button("💾 儲存", disabled=not pid, use_container_width=True,
                              help="把目前輸入的資料存到這位病患"):
                 dialog_to_open = "save"
             if c_hist.button("🕘 紀錄", disabled=not pid, use_container_width=True,
                              help="查看、載入或刪除歷史紀錄"):
                 dialog_to_open = "history"
-            if c_mgr.button("👥 病患", use_container_width=True,
-                            help="新增、選擇或刪除病患"):
-                dialog_to_open = "patients"
-            with c_user.popover("👤", use_container_width=True):
-                st.markdown(f"**{user['username']}**")
-                st.button("登出", on_click=cb_logout, use_container_width=True)
+            # 病患管理與登出整合成一個按鈕
+            with c_acct.popover("👤 帳號", use_container_width=True):
+                st.caption(f"登入身分:**{user['username']}**")
+                if st.button("👥 新增 / 管理病患", use_container_width=True):
+                    dialog_to_open = "patients"
+                st.button("🚪 登出", on_click=cb_logout, use_container_width=True)
 
 show_db_error()
 
