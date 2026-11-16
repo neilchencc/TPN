@@ -12,7 +12,12 @@ TPN / PN 計算器 (Streamlit)
   - 病患、歷史紀錄都可單獨刪除 (刪除前會再確認)
   - 計算器不登入也能使用
   - 需要 Streamlit >= 1.40 (st.dialog、具 key 的 container)
-  - 資料存在 SQLite 檔案 tpn_calc.db (位置見 _pick_db_path)
+  - 資料存在 Google 試算表 (gspread + 服務帳號),設定寫在 .streamlit/secrets.toml:
+        [gsheets]
+        spreadsheet = "試算表網址或 ID"
+        [gcp_service_account]
+        ... (服務帳號 JSON 金鑰的內容)
+    第一次執行會自動建立 users / patients / records / unit_beds / unit_records 工作表
 單位帳號 (仿照 NICU 計算器的 PICU / NBC):
   - 登入時可選 6A / 8A8B (密碼預設 hmmch,可在 .streamlit/secrets.toml 以
     [passwords] 6A = "..." 覆寫) 或個人帳號
@@ -27,16 +32,16 @@ import html
 import json
 import secrets
 import functools
-import os
 import re
-import sqlite3
-import tempfile
-from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
+import gspread
 import pandas as pd
+import requests
 import streamlit as st
+from google.auth.exceptions import GoogleAuthError
+from gspread.exceptions import GSpreadException, WorksheetNotFound
 
 try:
     from zoneinfo import ZoneInfo
@@ -130,93 +135,116 @@ DEFAULT_BAGS = pd.DataFrame(
 ).astype(float)
 
 # ----------------------------------------------------------------------
-# 資料庫 (SQLite): 帳號、病患、紀錄
+# 資料儲存 (Google 試算表): 帳號、病患、紀錄
+# 每個「表」是試算表中的一個工作表,第 1 列為欄名,之後每列一筆資料。
+# 寫入一律用 RAW,文字 (例如以 = 開頭的備註、012 這種床號) 不會被當成公式或數字。
 # ----------------------------------------------------------------------
-DB_FILENAME = "tpn_calc.db"
-
-
-def _pick_db_path() -> Path:
-    """找一個可以正常寫入的位置放資料庫。
-    Streamlit Cloud 的程式資料夾 (/mount/src/...) 是掛載的檔案系統,SQLite 在上面可能無法寫入,
-    所以優先放家目錄或暫存資料夾,最後才試程式資料夾。
-    可用環境變數 TPN_DB_DIR 指定資料夾。"""
-    candidates = []
-    if os.environ.get("TPN_DB_DIR"):
-        candidates.append(Path(os.environ["TPN_DB_DIR"]))
-    candidates += [Path.home() / ".tpn_calc", Path(tempfile.gettempdir()) / "tpn_calc",
-                   Path(__file__).parent]
-    for folder in candidates:
-        path = folder / DB_FILENAME
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-            with closing(sqlite3.connect(path)) as c:
-                # 模擬實際寫入 (含 journal 檔),測完 rollback 不留痕跡
-                c.execute("BEGIN IMMEDIATE")
-                c.execute("CREATE TABLE IF NOT EXISTS _write_test (x TEXT)")
-                c.execute("INSERT INTO _write_test VALUES ('ok')")
-                c.rollback()
-            return path
-        except (sqlite3.Error, OSError):
-            continue
-    raise RuntimeError("找不到可寫入的位置來存放資料庫")
-
-
-DB_PATH = _pick_db_path()
+TABLES = {
+    "users": ["id", "username", "pw_hash", "salt", "created_at"],
+    "patients": ["id", "user_id", "name", "created_at"],
+    "records": ["id", "patient_id", "created_at", "note", "data"],
+    # 單位帳號 (6A / 8A8B): 自訂床位與各床紀錄
+    "unit_beds": ["id", "unit", "bed", "created_at"],
+    "unit_records": ["id", "unit", "bed", "created_at", "note", "data"],
+}
+CACHE_TTL = 30  # 秒;讀取結果暫存,避免每次操作都呼叫 Google API (每分鐘有次數上限)
 MIN_LEN = 4  # 帳號、密碼最少字數
 PBKDF2_ROUNDS = 200_000
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+class StorageError(Exception):
+    """試算表設定或連線問題。"""
 
 
-def init_db() -> None:
-    with closing(db()) as c, c:
-        c.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                username   TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                pw_hash    TEXT NOT NULL,
-                salt       TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS patients (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                name       TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE (user_id, name)
-            );
-            CREATE TABLE IF NOT EXISTS records (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                patient_id INTEGER NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
-                created_at TEXT NOT NULL,
-                note       TEXT,
-                data       TEXT NOT NULL
-            );
-            -- 單位帳號 (6A / 8A8B): 自訂床位與各床紀錄
-            CREATE TABLE IF NOT EXISTS unit_beds (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                unit       TEXT NOT NULL,
-                bed        TEXT NOT NULL COLLATE NOCASE,
-                created_at TEXT NOT NULL,
-                UNIQUE (unit, bed)
-            );
-            CREATE TABLE IF NOT EXISTS unit_records (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                unit       TEXT NOT NULL,
-                bed        TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                note       TEXT,
-                data       TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_unit_records ON unit_records (unit, bed, id);
-            """
-        )
+# 會被 db_safe 攔下、改成畫面上顯示的錯誤
+DB_ERRORS = (StorageError, GSpreadException, GoogleAuthError,
+             requests.exceptions.RequestException)
+
+
+@st.cache_resource(show_spinner=False)
+def _sheets() -> dict:
+    """連線到試算表並確認各工作表存在 (不存在就建立),回傳 {表名: worksheet}。"""
+    try:
+        creds = dict(st.secrets["gcp_service_account"])
+        sheet_ref = str(st.secrets["gsheets"]["spreadsheet"]).strip()
+    except Exception as e:
+        raise StorageError(
+            "找不到 Google 試算表設定:請在 secrets 加入 [gsheets] spreadsheet 與 "
+            f"[gcp_service_account] ({type(e).__name__})") from e
+    client = gspread.service_account_from_dict(creds)
+    book = (client.open_by_url(sheet_ref) if sheet_ref.startswith("http")
+            else client.open_by_key(sheet_ref))
+    wss = {}
+    for name, cols in TABLES.items():
+        try:
+            ws = book.worksheet(name)
+        except WorksheetNotFound:
+            ws = book.add_worksheet(title=name, rows=1000, cols=len(cols))
+        if ws.row_values(1) != cols:
+            ws.update(range_name="A1", values=[cols], value_input_option="RAW")
+        wss[name] = ws
+    return wss
+
+
+def _rows_from_values(name: str, values: list) -> list:
+    cols = TABLES[name]
+    out = []
+    for row in values[1:]:
+        if not any(row):
+            continue
+        row = list(row) + [""] * (len(cols) - len(row))
+        out.append(dict(zip(cols, row)))
+    return out
+
+
+def _read_fresh(name: str) -> list:
+    """直接從試算表讀取 (不經暫存),回傳 [{欄名: 值(字串)}, ...],依寫入順序。"""
+    return _rows_from_values(name, _sheets()[name].get_all_values())
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def _read(name: str) -> list:
+    """讀取並暫存 CACHE_TTL 秒;本程式寫入後會立即清除暫存。"""
+    return _read_fresh(name)
+
+
+def _insert(name: str, row: dict) -> None:
+    ws = _sheets()[name]
+    ws.append_row([str(row.get(c, "")) for c in TABLES[name]],
+                  value_input_option="RAW", insert_data_option="INSERT_ROWS",
+                  table_range="A1")
+    _read.clear()
+
+
+def _delete_where(name: str, pred) -> int:
+    """刪除符合條件的所有列 (一次 API 呼叫),回傳刪除筆數。"""
+    ws = _sheets()[name]
+    values = ws.get_all_values()
+    cols = TABLES[name]
+    row_nums = []  # 試算表列號 (1 起算;第 1 列為欄名)
+    for i, row in enumerate(values[1:], start=2):
+        row = list(row) + [""] * (len(cols) - len(row))
+        if any(row) and pred(dict(zip(cols, row))):
+            row_nums.append(i)
+    if row_nums:
+        # 由下往上刪,前面的列號才不會位移
+        reqs = [{"deleteDimension": {"range": {"sheetId": ws.id, "dimension": "ROWS",
+                                               "startIndex": r - 1, "endIndex": r}}}
+                for r in sorted(row_nums, reverse=True)]
+        ws.spreadsheet.batch_update({"requests": reqs})
+    _read.clear()
+    return len(row_nums)
+
+
+def _new_id(prefix: str) -> str:
+    # 以英文字母開頭,避免試算表把它當成數字
+    return f"{prefix}{secrets.token_hex(6)}"
+
+
+def _newest_first(rows: list) -> list:
+    """依 created_at 由新到舊;同時間者後寫入的排前面。"""
+    return [r for _, r in sorted(enumerate(rows),
+                                 key=lambda t: (t[1]["created_at"], t[0]), reverse=True)]
 
 
 def now_str() -> str:
@@ -235,82 +263,68 @@ def create_user(username: str, password: str):
         return None, f"帳號至少需要 {MIN_LEN} 個字"
     if len(password) < MIN_LEN:
         return None, f"密碼至少需要 {MIN_LEN} 個字"
-    salt = secrets.token_hex(16)
-    try:
-        with closing(db()) as c, c:
-            cur = c.execute(
-                "INSERT INTO users (username, pw_hash, salt, created_at) VALUES (?, ?, ?, ?)",
-                (username, _hash_pw(password, salt), salt, now_str()),
-            )
-            return cur.lastrowid, None
-    except sqlite3.IntegrityError:
+    if any(u["username"].lower() == username.lower() for u in _read_fresh("users")):
         return None, "此帳號已被使用"
+    salt = secrets.token_hex(16)
+    uid = _new_id("u")
+    _insert("users", {"id": uid, "username": username, "pw_hash": _hash_pw(password, salt),
+                      "salt": salt, "created_at": now_str()})
+    return uid, None
 
 
 def verify_user(username: str, password: str):
     """帳密正確回傳 {'id', 'username'},否則 None。"""
-    with closing(db()) as c:
-        row = c.execute("SELECT * FROM users WHERE username = ?", (username.strip(),)).fetchone()
+    name = username.strip().lower()
+    row = next((u for u in _read("users") if u["username"].lower() == name), None)
     if row and hmac.compare_digest(row["pw_hash"], _hash_pw(password, row["salt"])):
         return {"id": row["id"], "username": row["username"]}
     return None
 
 
-def list_patients(user_id: int) -> list:
-    with closing(db()) as c:
-        return c.execute(
-            """SELECT p.id, p.name, COUNT(r.id) AS n FROM patients p
-               LEFT JOIN records r ON r.patient_id = p.id
-               WHERE p.user_id = ? GROUP BY p.id ORDER BY p.created_at, p.id""",
-            (user_id,),
-        ).fetchall()
+def _owned_patient_ids(user_id: str) -> set:
+    return {p["id"] for p in _read("patients") if p["user_id"] == user_id}
 
 
-def create_patient(user_id: int, name: str):
-    try:
-        with closing(db()) as c, c:
-            cur = c.execute("INSERT INTO patients (user_id, name, created_at) VALUES (?, ?, ?)",
-                            (user_id, name, now_str()))
-            return cur.lastrowid, None
-    except sqlite3.IntegrityError:
+def list_patients(user_id: str) -> list:
+    counts = {}
+    for r in _read("records"):
+        counts[r["patient_id"]] = counts.get(r["patient_id"], 0) + 1
+    return [{"id": p["id"], "name": p["name"], "n": counts.get(p["id"], 0)}
+            for p in _read("patients") if p["user_id"] == user_id]
+
+
+def create_patient(user_id: str, name: str):
+    if any(p["user_id"] == user_id and p["name"] == name for p in _read_fresh("patients")):
         return None, f"已經有名為「{name}」的病患"
+    pid = _new_id("p")
+    _insert("patients", {"id": pid, "user_id": user_id, "name": name, "created_at": now_str()})
+    return pid, None
 
 
-def delete_patient(user_id: int, patient_id: int) -> None:
-    # 紀錄會透過 ON DELETE CASCADE 一併刪除
-    with closing(db()) as c, c:
-        c.execute("DELETE FROM patients WHERE id = ? AND user_id = ?", (patient_id, user_id))
+def delete_patient(user_id: str, patient_id: str) -> None:
+    if patient_id not in _owned_patient_ids(user_id):
+        return
+    _delete_where("records", lambda r: r["patient_id"] == patient_id)
+    _delete_where("patients", lambda p: p["id"] == patient_id and p["user_id"] == user_id)
 
 
-def add_record(user_id: int, patient_id: int, note: str, data: dict) -> bool:
-    with closing(db()) as c, c:
-        owner = c.execute("SELECT 1 FROM patients WHERE id = ? AND user_id = ?",
-                          (patient_id, user_id)).fetchone()
-        if not owner:
-            return False
-        c.execute("INSERT INTO records (patient_id, created_at, note, data) VALUES (?, ?, ?, ?)",
-                  (patient_id, now_str(), note, json.dumps(data, ensure_ascii=False)))
-        return True
+def add_record(user_id: str, patient_id: str, note: str, data: dict) -> bool:
+    if patient_id not in _owned_patient_ids(user_id):
+        return False
+    _insert("records", {"id": _new_id("r"), "patient_id": patient_id, "created_at": now_str(),
+                        "note": note, "data": json.dumps(data, ensure_ascii=False)})
+    return True
 
 
-def list_records(user_id: int, patient_id: int) -> list:
-    with closing(db()) as c:
-        return c.execute(
-            """SELECT r.id, r.created_at, r.note, r.data FROM records r
-               JOIN patients p ON p.id = r.patient_id
-               WHERE r.patient_id = ? AND p.user_id = ?
-               ORDER BY r.created_at DESC, r.id DESC""",
-            (patient_id, user_id),
-        ).fetchall()
+def list_records(user_id: str, patient_id: str) -> list:
+    if patient_id not in _owned_patient_ids(user_id):
+        return []
+    return _newest_first([r for r in _read("records") if r["patient_id"] == patient_id])
 
 
-def delete_record(user_id: int, record_id: int) -> None:
-    with closing(db()) as c, c:
-        c.execute(
-            """DELETE FROM records WHERE id = ? AND patient_id IN
-               (SELECT id FROM patients WHERE user_id = ?)""",
-            (record_id, user_id),
-        )
+def delete_record(user_id: str, record_id: str) -> None:
+    owned = _owned_patient_ids(user_id)
+    _delete_where("records", lambda r: r["id"] == record_id and r["patient_id"] in owned)
 
 
 # ----------------------------------------------------------------------
@@ -341,8 +355,7 @@ def bed_sort_key(bed: str):
 
 
 def list_beds(unit: str) -> list:
-    with closing(db()) as c:
-        beds = [r["bed"] for r in c.execute("SELECT bed FROM unit_beds WHERE unit = ?", (unit,))]
+    beds = [b["bed"] for b in _read("unit_beds") if b["unit"] == unit]
     return sorted(beds, key=bed_sort_key)
 
 
@@ -353,56 +366,44 @@ def add_bed(unit: str, bed: str):
         return "請輸入床號"
     if len(bed) > BED_MAX_LEN:
         return f"床號最多 {BED_MAX_LEN} 個字"
-    try:
-        with closing(db()) as c, c:
-            c.execute("INSERT INTO unit_beds (unit, bed, created_at) VALUES (?, ?, ?)",
-                      (unit, bed, now_str()))
-    except sqlite3.IntegrityError:
+    if any(b["unit"] == unit and b["bed"].lower() == bed.lower()
+           for b in _read_fresh("unit_beds")):
         return f"已經有床位「{bed}」"
+    _insert("unit_beds", {"id": _new_id("b"), "unit": unit, "bed": bed,
+                          "created_at": now_str()})
     return None
 
 
 def delete_bed(unit: str, bed: str) -> None:
     """刪除床位及其所有紀錄。"""
-    with closing(db()) as c, c:
-        c.execute("DELETE FROM unit_records WHERE unit = ? AND bed = ?", (unit, bed))
-        c.execute("DELETE FROM unit_beds WHERE unit = ? AND bed = ?", (unit, bed))
+    _delete_where("unit_records", lambda r: r["unit"] == unit and r["bed"] == bed)
+    _delete_where("unit_beds", lambda b: b["unit"] == unit and b["bed"] == bed)
 
 
 def unit_add_record(unit: str, bed: str, note: str, data: dict) -> bool:
-    with closing(db()) as c, c:
-        if not c.execute("SELECT 1 FROM unit_beds WHERE unit = ? AND bed = ?",
-                         (unit, bed)).fetchone():
-            return False
-        c.execute("INSERT INTO unit_records (unit, bed, created_at, note, data) "
-                  "VALUES (?, ?, ?, ?, ?)",
-                  (unit, bed, now_str(), note, json.dumps(data, ensure_ascii=False)))
-        return True
+    if bed not in list_beds(unit):
+        return False
+    _insert("unit_records", {"id": _new_id("r"), "unit": unit, "bed": bed,
+                             "created_at": now_str(), "note": note,
+                             "data": json.dumps(data, ensure_ascii=False)})
+    return True
 
 
 def unit_list_records(unit: str, bed: str) -> list:
-    with closing(db()) as c:
-        return c.execute(
-            """SELECT id, created_at, note, data FROM unit_records
-               WHERE unit = ? AND bed = ? ORDER BY created_at DESC, id DESC""",
-            (unit, bed),
-        ).fetchall()
+    return _newest_first([r for r in _read("unit_records")
+                          if r["unit"] == unit and r["bed"] == bed])
 
 
-def unit_delete_record(unit: str, record_id: int) -> None:
-    with closing(db()) as c, c:
-        c.execute("DELETE FROM unit_records WHERE id = ? AND unit = ?", (record_id, unit))
+def unit_delete_record(unit: str, record_id: str) -> None:
+    _delete_where("unit_records", lambda r: r["id"] == record_id and r["unit"] == unit)
 
 
 def unit_latest(unit: str) -> dict:
     """{bed: (created_at, data)} 每床最近一筆。"""
-    with closing(db()) as c:
-        rows = c.execute("SELECT bed, created_at, data FROM unit_records WHERE unit = ? "
-                         "ORDER BY created_at, id", (unit,)).fetchall()
-    return {r["bed"]: (r["created_at"], json.loads(r["data"])) for r in rows}
-
-
-init_db()
+    out = {}
+    for r in reversed(_newest_first([r for r in _read("unit_records") if r["unit"] == unit])):
+        out[r["bed"]] = (r["created_at"], json.loads(r["data"]))
+    return out
 
 # ----------------------------------------------------------------------
 # 輸入欄位的狀態 (用 session_state 才能從歷史紀錄載入)
@@ -491,15 +492,29 @@ def rerun_if_requested() -> None:
         st.rerun()
 
 
+def db_error_text(e: Exception) -> str:
+    return (f"Google 試算表錯誤 ({type(e).__name__}):{e}\n\n"
+            "請確認 secrets 設定正確,且試算表已「共用」給服務帳號 (編輯者)。")
+
+
 def db_safe(func):
     """資料庫出錯時不讓整個 app 當掉,改把真正的錯誤訊息顯示在畫面上。"""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except sqlite3.Error as e:
-            ss._db_err = f"資料庫錯誤 ({type(e).__name__}):{e}\n\n資料庫位置:{DB_PATH}"
+        except DB_ERRORS as e:
+            ss._db_err = db_error_text(e)
     return wrapper
+
+
+def safe_read(func, *args, default=None):
+    """對話框裡讀資料用:出錯時顯示錯誤訊息並回傳 default,不讓對話框當掉。"""
+    try:
+        return func(*args)
+    except DB_ERRORS as e:
+        st.error(db_error_text(e))
+        return default
 
 
 def show_db_error() -> None:
@@ -746,7 +761,7 @@ def patients_dialog() -> None:
         st.error(err)
 
     st.divider()
-    plist = list_patients(ss.user["id"])
+    plist = safe_read(list_patients, ss.user["id"], default=[])
     if not plist:
         st.caption("尚無病患")
     for p in plist:
@@ -784,11 +799,11 @@ def beds_dialog(unit: str) -> None:
     st.caption("床位依床號排序;刪除床位會一併刪除該床所有紀錄。")
 
     st.divider()
-    beds = list_beds(unit)
+    beds = safe_read(list_beds, unit, default=[])
     if not beds:
         st.caption("尚無床位")
     for bed in beds:
-        n = len(unit_list_records(unit, bed))
+        n = len(safe_read(unit_list_records, unit, bed, default=[]))
         with st.container(border=True):
             c1, c2, c3 = st.columns([3, 1.3, 1.3], vertical_alignment="center")
             current = "　✅ 目前" if bed == ss.get("bed_sel") else ""
@@ -860,7 +875,7 @@ def history_dialog(target: tuple, label: str) -> None:
     rerun_if_requested()
     show_db_error()
     st.markdown(_target_title(target, label))
-    recs = target_records(target)
+    recs = safe_read(target_records, target, default=[])
     if not recs:
         st.caption("尚無紀錄。調整好配方後,按上方「💾 儲存」即可存檔。")
         return
@@ -1082,25 +1097,34 @@ def render_notes(notes: list) -> None:
     )
 
 # --- 登入狀態: 單位帳號 (床位) 或個人帳號 (病患) ---
-unit = ss.get("unit")
-user = ss.get("user")
+# 試算表連不上時計算器照常可用,只是無法登入 / 儲存
+storage_err = None
+try:
+    _sheets()
+except DB_ERRORS as e:
+    storage_err = db_error_text(e)
+unit = ss.get("unit") if not storage_err else None
+user = ss.get("user") if not storage_err else None
 beds, bed_latest = [], {}
-if unit:
-    beds = list_beds(unit)
-    bed_latest = unit_latest(unit)
-    if ss.get("bed_sel") not in beds:
-        if beds:
-            ss.bed_sel = beds[0]
-        else:
-            ss.pop("bed_sel", None)
 patients = {}
-if user:
-    patients = {p["id"]: p["name"] for p in list_patients(user["id"])}
-    if ss.get("patient_id") not in patients:
-        if patients:
-            ss.patient_id = next(iter(patients))
-        else:
-            ss.pop("patient_id", None)
+try:
+    if unit:
+        beds = list_beds(unit)
+        bed_latest = unit_latest(unit)
+        if ss.get("bed_sel") not in beds:
+            if beds:
+                ss.bed_sel = beds[0]
+            else:
+                ss.pop("bed_sel", None)
+    if user:
+        patients = {p["id"]: p["name"] for p in list_patients(user["id"])}
+        if ss.get("patient_id") not in patients:
+            if patients:
+                ss.patient_id = next(iter(patients))
+            else:
+                ss.pop("patient_id", None)
+except DB_ERRORS as e:
+    storage_err = db_error_text(e)
 pid = ss.get("patient_id") if user else None
 bed = ss.get("bed_sel") if unit else None
 # 目前存檔對象: ("unit", 單位, 床號) 或 ("acct", 病患 id)
@@ -1131,7 +1155,7 @@ with st.container(key="app_header"):
             c_note, c_login = st.columns(2, vertical_alignment="center")
             with c_note.container(key="notice"):
                 render_notes(_notes)
-            if c_login.button("🔑 登入 / 註冊",
+            if c_login.button("🔑 登入 / 註冊", disabled=bool(storage_err),
                               help=f"{' / '.join(UNITS)} 單位帳號或個人帳號:"
                                    "登入後可儲存與查看歷史紀錄"):
                 dialog_to_open = "auth"
@@ -1177,6 +1201,8 @@ with st.container(key="app_header"):
                 st.button("🚪 登出", on_click=cb_logout, use_container_width=True)
 
 show_db_error()
+if storage_err:
+    st.error(storage_err + "\n\n(計算器仍可使用,但暫時無法登入與儲存)")
 
 # ----------------------------------------------------------------------
 # 側邊欄: 病人資料
